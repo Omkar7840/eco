@@ -1,4 +1,4 @@
-# Sarvm Auth Service — Complete Architecture & Workflow Documentation
+# SarvM Admin Panel — Architecture & Workflow Blueprint
 
 ---
 
@@ -23,1261 +23,1114 @@
 
 ## 1. Executive Overview
 
-### 1.1 What is the Auth Service?
+### What is the Admin Panel?
+The **SarvM Admin Panel** is an internal, web-based management dashboard built for administrative users of the SarvM marketplace platform. It provides a centralised interface for managing **shops, retailers, employees, products/catalogs, orders, KYC verification, subscriptions, logistics, and reporting** across the entire SarvM ecosystem.
 
-The **Auth Service** is the centralized authentication and authorization gateway for the entire Sarvm ecosystem. It serves as the **single entry point** (API Gateway) for all client applications — Retailer App, Household App, Logistics Delivery App, and the Admin Panel.
+### Why does it exist?
+- **Centralised Operations**: Enables the operations team to manage the entire SarvM B2B/B2C marketplace from one place—reviewing KYC documents, toggling shop statuses, managing product catalogs, viewing order reports, and processing retailer payouts.
+- **Data Visibility**: Provides real-time dashboards and downloadable reports across all platform entities (users, sellers, orders, subscriptions, logistics, referrals, tickets, rewards, deleted accounts, wallet payouts).
+- **Content Moderation**: Allows admins to approve/reject retailer product requests, custom catalog requests, and missing product images before they go live on the consumer-facing apps.
 
-### 1.2 Why does it exist?
+### Who uses it?
+Internal SarvM staff—operations managers, support agents, and administrators who require elevated privileges over the platform data.
 
-- **Centralized Authentication**: Instead of every microservice implementing its own auth logic, the auth_service handles JWT token generation, verification, and decoding in a single place.
-- **API Gateway / Reverse Proxy**: It does not just authenticate — it also **proxies** all authenticated requests forward to downstream microservices (Retailer Service, Order Service, Catalogue Service, User Management Service, Logistics Service) via an internal load balancer. This means every request from the frontend hits the auth_service first, gets validated, and then is forwarded to the appropriate backend service.
-- **Multi-App Support**: The service is app-aware. The JWT payload is dynamically constructed based on which application is requesting the token (`retailerApp`, `householdApp`, `logisticsDelivery`, `admin`), embedding app-specific metadata (shop details for retailers, onboarding status for logistics, admin roles, etc.).
-
-### 1.3 What does it do at a high level?
-
-1. **Issues JWT tokens** (access + refresh) when a user is authenticated (after OTP verification by another service).
-2. **Issues anonymous tokens** for unauthenticated access (guest browsing).
-3. **Verifies JWT tokens** on every incoming request before proxying it downstream.
-4. **Decodes JWT tokens** as Express middleware, attaching the decoded payload to `req.authPayload` for downstream consumption.
-5. **Proxies requests** to internal microservices via `http-proxy-middleware`.
-6. **Enriches token payloads** with cross-service data (e.g., calls the Retailer Management Service to get shop data, or the Logistics Management Service for delivery profile data).
-
-### 1.4 Where does it sit in the ecosystem?
-
-```
-┌──────────────┐       ┌──────────────────┐       ┌──────────────────────────┐
-│  Client Apps │──────▶│   Auth Service   │──────▶│  Internal Microservices  │
-│  (Mobile/Web)│       │  (API Gateway)   │       │  (rms, oms, cms, ums,    │
-│              │       │  Port 3200       │       │   lms)                   │
-└──────────────┘       └──────────────────┘       └──────────────────────────┘
-```
-
-Every frontend request goes through the Auth Service. It is the **gatekeeper**.
+### Key Design Decisions
+| Decision | Rationale |
+|---|---|
+| **Angular 14 (not latest)** | Aligns with the existing Ionic 6 toolkit used across SarvM's mobile apps, enabling shared knowledge. |
+| **Flat routing (no lazy-loading)** | All routes eagerly loaded. Trade-off: faster initial dev speed over bundle optimisation. |
+| **`localStorage` for state** | Token and service state persisted in `localStorage` using base64 encoding—avoids server-side session management for a purely internal tool. |
+| **Single gateway API** | All API calls route through one `baseUrl` (e.g., `https://dev-api.sarvm.ai`) which acts as an API gateway, proxying to backend microservices (`ums`, `rms`, `cms`, `oms`, `lms`, `sub`, `pmt`, `wlt`, `ref_ms`, `pss`, `hms`, `onbs`). |
 
 ---
 
 ## 2. System Architecture
 
-### 2.1 High-Level Architecture Diagram
+### High-Level Architecture Diagram
 
 ```mermaid
 graph TB
-    subgraph "Client Applications"
-        RA["Retailer App (Mobile)"]
-        HA["Household App (Mobile)"]
-        LD["Logistics Delivery App"]
-        AD["Admin Panel (Web)"]
+    subgraph "Admin Panel (Angular 14 SPA)"
+        A[AppComponent] --> B[HeaderComponent]
+        A --> C[RouterOutlet]
+        B --> D[SidebarComponent]
+        C --> E[Feature Pages]
+        C --> F[Auth Pages]
     end
 
-    subgraph "Auth Service (Port 3200)"
-        MW["Middleware Layer"]
-        RT["Router Layer"]
-        CT["Controller Layer"]
-        SV["Service Layer"]
-        AM["AuthManager (JWT Engine)"]
-        DB_CONN["MongoDB Connection (Singleton)"]
+    subgraph "Shared Layer"
+        G[InterceptorService] --> H["Bearer Token Injection"]
+        I[StorageService] --> J["localStorage (base64)"]
+        K[CommonApi] --> L[GenericApi]
+        L --> M[HttpClient]
     end
 
-    subgraph "Internal Microservices (via Load Balancer)"
-        RMS["Retailer Mgmt Service (rms)"]
-        UMS["User Mgmt Service (ums)"]
-        OMS["Order Service (oms)"]
-        CMS["Catalogue Mgmt Service (cms)"]
-        LMS["Logistics Mgmt Service (lms)"]
+    subgraph "API Gateway"
+        N["dev-api.sarvm.ai / uat-api.sarvm.ai / api.sarvm.ai"]
     end
 
-    subgraph "Data Store"
-        MONGO["MongoDB / AWS DocumentDB"]
+    subgraph "Backend Microservices"
+        O[UMS - User Management]
+        P[RMS - Retailer Management]
+        Q[CMS - Catalog Management]
+        R[OMS - Order Management]
+        S[LMS - Logistics Management]
+        T[SUB - Subscription Service]
+        U[PMT - Payment Service]
+        V[WLT - Wallet Service]
+        W[REF_MS - Referral Service]
+        X[PSS - Product Search Service]
+        Y[HMS - Household Service]
+        Z[ONBS - Onboarding Service]
     end
 
-    RA -->|HTTPS| MW
-    HA -->|HTTPS| MW
-    LD -->|HTTPS| MW
-    AD -->|HTTPS| MW
-
-    MW -->|"Decode JWT (AuthManager.decodeAuthToken)"| RT
-    RT -->|"/auth/apis/v1/*"| CT
-    RT -->|"Catch-all '*' proxy"| SV
-    CT --> SV
-    SV --> AM
-    AM -->|"jwt.sign / jwt.verify"| SV
-    CT -->|"User lookup"| DB_CONN
-    DB_CONN --> MONGO
-
-    CT -->|"GET shop data"| RMS
-    CT -->|"GET delivery profile"| LMS
-
-    MW -->|"Proxy (http-proxy-middleware)"| RMS
-    MW -->|"Proxy"| UMS
-    MW -->|"Proxy"| OMS
-    MW -->|"Proxy"| CMS
-    MW -->|"Proxy"| LMS
+    M --> |HTTP Requests| N
+    G --> M
+    N --> O & P & Q & R & S & T & U & V & W & X & Y & Z
 ```
 
-### 2.2 Architectural Role Breakdown
+### Component Layering
 
-| Role | What | Why |
-|------|------|-----|
-| **API Gateway** | All external traffic enters through Auth Service | Single point for auth enforcement; downstream services trust the gateway |
-| **Token Issuer** | Generates access + refresh JWT tokens | Clients need tokens to access protected resources |
-| **Token Verifier** | Validates JWT on every proxied request | Ensures only authenticated users reach backend services |
-| **Token Decoder** | Decodes JWT and attaches payload to `req.authPayload` | Downstream code (routes, controllers) can read user identity without re-decoding |
-| **Reverse Proxy** | Forwards authenticated requests to internal services | Clients don't need to know individual service URLs; load balancing is centralized |
-| **Data Enricher** | Fetches shop/logistic data during token generation | JWT payload must contain role-specific metadata for the frontend |
+```mermaid
+graph LR
+    subgraph "Presentation Layer"
+        Pages["Pages (home, reports, shoplist, etc.)"]
+        Components["Components (catalog, order, profile, etc.)"]
+        Layout["Layout (header, sidebar)"]
+        Shared["Shared (table, pagination)"]
+    end
 
-### 2.3 Layered Architecture
+    subgraph "Service Layer"
+        FeatureServices["Feature Services (RetailerService, CatalogService, etc.)"]
+        CoreServices["Core Services (AuthService, CommonService, StorageService)"]
+        InfraServices["Infrastructure (InterceptorService, CommonApi, GenericApi)"]
+    end
 
-The auth_service follows a **strict layered architecture** modeled from the MVC pattern:
+    subgraph "Cross-Cutting"
+        Guards["Route Guards (AuthGuard, PublicGuard)"]
+        Pipes["Pipes (FilterPipe, LanguagePipe, ProductFilterPipe)"]
+        Validators["Validators (ForbiddenNameDirective)"]
+        Directives["Directives (NumberNegativeDirective, OnlyNumberDirective)"]
+    end
 
+    Pages --> FeatureServices
+    Components --> FeatureServices
+    FeatureServices --> InfraServices
+    CoreServices --> InfraServices
+    Guards --> CoreServices
 ```
-┌─────────────────────────────────────────────┐
-│                  server.js                  │  ← Entry Point & Express App Setup
-├─────────────────────────────────────────────┤
-│                 InitApp/                    │  ← Bootstrap: DB connect, session, middleware
-├─────────────────────────────────────────────┤
-│               routes/ (Router Layer)        │  ← URL → Controller mapping
-├─────────────────────────────────────────────┤
-│            controllers/ (Controller Layer)  │  ← Business logic orchestration
-├─────────────────────────────────────────────┤
-│             services/ (Service Layer)       │  ← JWT operations (sign/verify)
-├─────────────────────────────────────────────┤
-│               models/ (Data Layer)          │  ← Mongoose schemas
-├─────────────────────────────────────────────┤
-│                  db/ (DB Layer)             │  ← Singleton MongoDB connection
-├─────────────────────────────────────────────┤
-│              common/libs/ (Shared Libs)     │  ← AuthManager, ErrorHandler, etc.
-└─────────────────────────────────────────────┘
-```
+
+### Why this architecture?
+- **Separation of Concerns**: Presentation (templates + components), Service (business logic + API calls), and Infrastructure (HTTP, guards, interceptors) are clearly layered.
+- **Single HTTP Choke-Point**: All HTTP calls flow through `GenericApi → CommonApi → InterceptorService`, making it trivial to add global auth headers, error handling, and loading spinners.
+- **Guard-Protected Routes**: `AuthGuard` and `PublicGuard` ensure unauthenticated users can only access `/login` and `/otp`, while authenticated users skip the login screen.
 
 ---
 
 ## 3. Data Flow
 
-### 3.1 Token Generation Flow (Authenticated User — Retailer App)
-
-This is the most complex flow. It is triggered after OTP verification when the frontend calls `GET /auth/apis/v1/token/:userId`.
+### 3.1 Authentication Flow
 
 ```mermaid
 sequenceDiagram
-    participant Client as Retailer App
-    participant MW as Auth Middleware
-    participant Router as Express Router
-    participant Ctrl as AuthController
-    participant Svc as AuthService
-    participant AM as AuthManager
-    participant DB as MongoDB (Users)
-    participant RMS as Retailer Mgmt Service
+    participant User
+    participant LoginComponent
+    participant AuthService
+    participant CommonApi
+    participant InterceptorService
+    participant APIGateway
+    participant UMS
 
-    Client->>MW: GET /auth/apis/v1/token/:userId<br/>Headers: app_name, app_version_code, Authorization
-    MW->>MW: AuthManager.decodeAuthToken()<br/>Decode existing JWT (if any) → req.authPayload
-    MW->>MW: ReqLogger (log the request)
-    MW->>Router: Route to /auth/apis/v1/token/:userId
+    User->>LoginComponent: Enters mobile number
+    LoginComponent->>LoginComponent: Validates (10 digits, numeric)
+    LoginComponent->>AuthService: sendOtp({phone})
+    AuthService->>CommonApi: postData('/ums/apis/v1/users/send_otp/sms', {phone})
+    CommonApi->>InterceptorService: HTTP POST (unauthToken attached)
+    InterceptorService->>APIGateway: POST /ums/apis/v1/users/send_otp/sms
+    APIGateway->>UMS: Forward request
+    UMS-->>APIGateway: {success: true}
+    APIGateway-->>InterceptorService: Response
+    InterceptorService-->>CommonApi: Response
+    CommonApi-->>AuthService: Response
+    AuthService-->>LoginComponent: Success
+    LoginComponent->>LoginComponent: localStorage.setItem('phonenumber', mobile)
+    LoginComponent->>User: Navigate to /otp
 
-    Router->>Router: handleRESTReq() extracts headers, params, body, query
-    Router->>Ctrl: AuthController.getToken(dataValues)
+    User->>OtpComponent: Enters 4-digit OTP
+    OtpComponent->>AuthService: verifyOtp({phone, otp})
+    AuthService->>CommonApi: postData('/ums/apis/v1/users/verify_otp', {phone, otp})
+    CommonApi->>InterceptorService: HTTP POST
+    InterceptorService->>APIGateway: POST /ums/apis/v1/users/verify_otp
+    APIGateway->>UMS: Forward
+    UMS-->>APIGateway: {success: true, data: {accessToken: "JWT..."}}
+    APIGateway-->>OtpComponent: Response
 
-    Ctrl->>DB: Users.findById(userId)
-    DB-->>Ctrl: User document (phone, userType, flyyUserId, ...)
-
-    alt User not found
-        Ctrl-->>Client: 500 INTERNAL_SERVER_ERROR "user does not exists"
-    end
-
-    Ctrl->>RMS: apiServices.rms.getAllShopViaUserId({headers, body})<br/>via sarvm-utility
-    RMS-->>Ctrl: Shop data (shop_id, id, isKYCVerified, isSubscribed, GST_no)
-
-    Ctrl->>Ctrl: generateRetailerData()<br/>Build JWT payload with:<br/>entityType, entityId, userId, phone,<br/>userType, shopId, shopUniqueId,<br/>isEmployee, shopMeta, segmentId,<br/>flyyUserId, scope
-
-    Ctrl->>Svc: AuthService.issueToken(payload)
-    Svc->>AM: AuthManager.issueTokens(payload)
-
-    AM->>AM: jwt.sign(payload, secret, accessTokenOptions)<br/>→ accessToken
-    AM->>AM: jwt.sign({userId, scope:[]}, secret, refreshTokenOptions)<br/>→ refreshToken
-
-    AM-->>Svc: { accessToken, refreshToken, body: {} }
-    Svc-->>Ctrl: Token result
-    Ctrl-->>Router: Token result
-    Router->>Client: 200 { success: true, data: { accessToken, refreshToken } }
+    OtpComponent->>StorageService: set('admin-authToken', accessToken)
+    Note over StorageService: Token base64-encoded and stored in localStorage
+    OtpComponent->>AuthService: authState.next(true)
+    OtpComponent->>User: Navigate to /home + page reload
 ```
 
-#### Step-by-step breakdown:
+#### Why this flow?
+- **OTP-based auth**: No passwords; only phone + OTP. Suited for internal admin users with verified mobile numbers.
+- **unauthToken**: A pre-configured anonymous JWT is used for endpoints that need a token but the user hasn't logged in yet (e.g., the OTP endpoints themselves).
+- **Page reload**: After login, `window.location.reload()` is called to re-initialise all services (especially `CommonService.setUserData()` and `HeaderComponent.showMenu`).
 
-1. **Client sends request**: `GET /auth/apis/v1/token/63300cb5ea6a3078062a23fc` with headers `app_name: retailerApp`, `app_version_code: 101`, and `Authorization: accessToken <existing-jwt>`.
-2. **Why the Authorization header?**: The auth_service decodes any existing JWT to identify the user context. This header is also forwarded to inter-service calls (e.g., to RMS).
-3. **Middleware `decodeAuthToken`**: Runs on every request. Splits the `Authorization` header into subject (`accessToken` / `refreshToken`) and the JWT string. Verifies with `jwt.verify()`. If valid, decoded payload is placed on `req.authPayload`. If no token or invalid, it calls `next()` (no blocking for this middleware).
-4. **Route handler `handleRESTReq`**: Extracts `app_name`, `app_version_code`, `authorization` from `req.headers`. Merges `req.params` (`{ userId }`), `req.body`, `req.query`, and `req.authPayload` into a single `dataValues` object.
-5. **Controller `getToken`**: Looks up the user in MongoDB by `userId`. If not found, throws `INTERNAL_SERVER_ERROR`.
-6. **Cross-service call to RMS**: Calls `apiServices.rms.getAllShopViaUserId()` (provided by `sarvm-utility`) to fetch the shop linked to this user. This is an internal HTTP call to the Retailer Management Service.
-7. **Why?** Because the JWT for `retailerApp` must contain `shopId`, `shopUniqueId`, `shopMeta` (onboarding flags, KYC status, subscription status, GST).
-8. **Payload construction**: `generateRetailerData()` builds the JWT payload object with all the enriched data.
-9. **Token signing**: `AuthManager.issueTokens()` signs the access token with the full payload, and a minimal refresh token (just `userId` and empty scope). Both use HS256 algorithm.
-10. **Response**: Returns `{ accessToken, refreshToken }` to the client.
-
-### 3.2 Token Generation Flow — Logistics Delivery App
+### 3.2 Typical Protected API Call Flow
 
 ```mermaid
 sequenceDiagram
-    participant Client as Logistics App
-    participant Ctrl as AuthController
-    participant LMS as Logistics Mgmt Service
-    participant AM as AuthManager
+    participant Component
+    participant FeatureService
+    participant CommonApi
+    participant InterceptorService
+    participant APIGateway
+    participant BackendMS
 
-    Client->>Ctrl: GET /auth/apis/v1/token/:userId<br/>app_name: logisticsDelivery
-
-    Ctrl->>Ctrl: Users.findById(userId)
-    Ctrl->>LMS: GET /lms/apis/v1/profile/:userId<br/>(via axios → INTERNAL_LOAD_BALANCER)
-    LMS-->>Ctrl: { deliveryData: { onbording, subscribed } }
-
-    Ctrl->>Ctrl: generateLogisticData()<br/>Build payload with entityType: 'LU',<br/>onbording, subscribed, etc.
-
-    Ctrl->>AM: issueTokens(payload)
-    Note right of AM: Special: if scope[1]==="logisticsDelivery",<br/>body includes {onbording, subscribed}
-    AM-->>Client: { accessToken, refreshToken, body: {onbording, subscribed} }
+    Component->>FeatureService: Call method (e.g., getSellerReport())
+    FeatureService->>CommonApi: postData(ApiUrls.sellerReport, params)
+    CommonApi->>CommonApi: Prepend environment.baseUrl
+    CommonApi->>InterceptorService: HTTP POST
+    InterceptorService->>InterceptorService: Read token from StorageService
+    InterceptorService->>InterceptorService: Clone request with Bearer token + app_name + app_version_code
+    InterceptorService->>APIGateway: POST with full headers
+    APIGateway->>BackendMS: Route based on path prefix (/rms/, /cms/, /ums/, etc.)
+    BackendMS-->>APIGateway: JSON Response
+    APIGateway-->>InterceptorService: Response
+    InterceptorService-->>CommonApi: Response
+    CommonApi-->>FeatureService: Observable<response>
+    FeatureService-->>Component: Data for rendering
 ```
 
-**Why is deliveryData fetched?** The logistics app needs to know the driver's onboarding and subscription status immediately upon login, so this data is embedded in the token response body.
+#### Why this design?
+- **DRY principle**: The interceptor handles token injection for every outgoing request centrally. Individual services never deal with auth headers.
+- **Skip header**: For external calls (e.g., uploading to pre-signed S3 URLs, CDN links), a `skip: 'true'` header is set, and the interceptor strips it instead of injecting the Bearer token.
 
-### 3.3 Token Generation Flow — Admin Panel
+### 3.3 Route Guard Flow
 
 ```mermaid
-sequenceDiagram
-    participant Client as Admin Panel
-    participant Ctrl as AuthController
-    participant AM as AuthManager
-
-    Client->>Ctrl: GET /auth/apis/v1/token/:userId<br/>app_name: admin
-
-    Ctrl->>Ctrl: Users.findById(userId)
-    Ctrl->>Ctrl: generateAdminData()<br/>Reads user.adminData.status & role<br/>Payload includes: adminData: {status, role},<br/>scope: ['ADMIN']
-
-    Ctrl->>AM: issueTokens(payload)
-    AM-->>Client: { accessToken, refreshToken }
+flowchart TD
+    A[User navigates to URL] --> B{Route has AuthGuard?}
+    B -->|Yes| C{Token exists in localStorage?}
+    C -->|Yes| D[Allow access]
+    C -->|No| E[Redirect to /login]
+    B -->|No| F{Route has PublicGuard?}
+    F -->|Yes| G{Token exists in localStorage?}
+    G -->|Yes| H[Redirect to /home]
+    G -->|No| I[Allow access to login/otp]
+    F -->|No| J[Allow access - no guard]
 ```
-
-**Why scope `['ADMIN']`?** Admin users have a different scope array, distinguishing them from regular users. The `segmentId` for admin is derived from `user.adminData.role` if active, or `'non-admin'` otherwise.
-
-### 3.4 Unauthenticated (Anonymous) Token Flow
-
-```mermaid
-sequenceDiagram
-    participant Client as Any App
-    participant Router as Express Router
-    participant Ctrl as AuthController
-    participant AM as AuthManager
-
-    Client->>Router: GET /auth/apis/v1/unauth_token<br/>Headers: app_name, app_version_code
-    Router->>Ctrl: getUnauthorizeToken(dataValues)
-
-    Ctrl->>Ctrl: Build payload:<br/>{ userId: 'anonymous', scope: [app_name] }
-
-    Ctrl->>AM: issueTokens(payload)
-    AM-->>Client: { accessToken, refreshToken }
-```
-
-**Why anonymous tokens?** Before login (e.g., browsing a catalog, OTP request screen), the client needs a valid JWT to reach backend services. The anonymous token grants limited access with `userId: 'anonymous'`.
-
-### 3.5 API Gateway / Proxy Flow (All Non-Auth Requests)
-
-This is the most critical architectural pattern. **Any request that does NOT match `/auth/apis/*`** is treated as a proxy request.
-
-```mermaid
-sequenceDiagram
-    participant Client as Client App
-    participant MW as Auth Middleware
-    participant Verifier as AuthController.verifyToken
-    participant Proxy as http-proxy-middleware
-    participant Backend as Internal Microservice
-
-    Client->>MW: GET /rms/apis/v1/shop/list<br/>Authorization: accessToken <jwt>
-
-    MW->>MW: AuthManager.decodeAuthToken()<br/>Decode JWT → req.authPayload
-
-    Note over MW: Request does NOT match /auth/apis/*<br/>Falls through to catch-all app.all('*')
-
-    MW->>Verifier: verifyToken({headers, path, body})
-    Verifier->>Verifier: Extract JWT from Authorization header
-    Verifier->>Verifier: AuthService.verifyToken(jwtToken)
-    Verifier->>Verifier: AuthManager.verifyToken(token)<br/>jwt.verify(token, secret)
-
-    alt Token Valid
-        Verifier-->>MW: true
-        MW->>Proxy: Forward request to INTERNAL_LOAD_BALANCER
-        Proxy->>Backend: GET http://internal-lb/rms/apis/v1/shop/list
-        Backend-->>Client: Response
-    end
-
-    alt Token Invalid / Expired
-        Verifier-->>MW: INTERNAL_SERVER_ERROR
-        MW-->>Client: 500 Error
-    end
-```
-
-#### How the proxy works in `server.js`:
-
-```javascript
-// 1. WebSocket proxy for /whs path
-app.use('/whs', createProxyMiddleware(options));
-
-// 2. Catch-all: verify token, then proxy
-app.all('*', 
-  async (req, res, next) => {
-    // Verify the JWT token
-    await AuthController.verifyToken({ headers, path, body });
-    next(); // Token valid → proceed to proxy
-  },
-  createProxyMiddleware(options) // Forward to INTERNAL_LOAD_BALANCER
-);
-```
-
-**Why this architecture?**
-- The auth_service acts as a **transparent reverse proxy**. The client doesn't need to know the internal service URLs.
-- The `INTERNAL_LOAD_BALANCER` env variable points to an internal load balancer (e.g., AWS ALB/NLB) that routes `/rms/*` to the Retailer Service, `/oms/*` to Order Service, etc.
-- WebSocket connections to `/whs` are proxied directly without token verification (likely for real-time warehouse/delivery updates).
-
-### 3.6 Middleware Pipeline (Complete Request Lifecycle)
-
-```
-Request Arrives
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ 1. InitApp Middleware               │
-│    ├─ AuthManager.decodeAuthToken() │  ← Decode JWT, set req.authPayload
-│    ├─ Session Namespace (cls-hooked)│  ← Set sessionId, clientIp
-│    ├─ express.urlencoded()          │  ← Parse URL-encoded bodies
-│    └─ cors()                        │  ← Enable CORS
-│    └─ ReqLogger                     │  ← Log request
-│    └─ MongoDB connect (Singleton)   │  ← One-time DB connection
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ 2. server.js Middleware             │
-│    ├─ express.urlencoded()          │  ← Parse URL-encoded (again)
-│    ├─ cors()                        │  ← CORS (again)
-│    ├─ AuthManager.decodeAuthToken() │  ← Decode JWT (again)
-│    └─ ReqLogger                     │  ← Log request
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ 3. Route Matching                   │
-│    ├─ /auth/apis/healthcheck        │  → Health check response
-│    ├─ /auth/apis/apidocs            │  → Swagger UI
-│    ├─ /auth/apis/v1/token/:userId   │  → getToken()
-│    ├─ /auth/apis/v1/token (POST)    │  → generateToken()
-│    ├─ /auth/apis/v1/unauth_token    │  → getUnauthorizeToken()
-│    ├─ /whs/*                        │  → Direct proxy (no auth check)
-│    └─ * (catch-all)                 │  → verifyToken() → Proxy
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ 4. Error Handling                   │
-│    ├─ 404 PAGE_NOT_FOUND_ERROR      │  ← Unmatched routes
-│    └─ Global Error Handler          │  ← BaseError → handleError()
-│       └─ Non-BaseError → wrap in    │
-│          INTERNAL_SERVER_ERROR       │
-└─────────────────────────────────────┘
-```
-
-> **Note:** There is a duplication of middleware between `InitApp/index.js` and `server.js`. Both register `decodeAuthToken`, `cors()`, `urlencoded()`, and `ReqLogger`. This means these middleware run **twice** per request — once in InitApp and once in server.js. This is a known code smell (see [Section 11: Edge Cases & Limitations](#11-edge-cases--limitations)).
 
 ---
 
 ## 4. Tech Stack
 
-### 4.1 Core Runtime & Framework
+### Core Framework & Libraries
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| **Node.js** | 18.20.5 (prod), 17.9.1 (dev/staging) | Server-side JavaScript runtime. Chosen for its non-blocking I/O model, ideal for a proxy/gateway service that is I/O-heavy. |
-| **Express.js** | ^4.18.1 | De facto standard Node.js web framework. Provides routing, middleware pipeline, and request/response handling. |
+| Technology | Version | Purpose | Why Chosen |
+|---|---|---|---|
+| **Angular** | 14.x | Application framework | Aligns with existing SarvM Ionic mobile apps; strong TypeScript support; mature ecosystem for enterprise apps. |
+| **TypeScript** | ~4.7.2 | Type-safe JavaScript | Compile-time type checking reduces runtime errors in a large admin tool. |
+| **RxJS** | ~7.5.0 | Reactive programming | Angular's native async paradigm for HTTP calls, state management via `BehaviorSubject`. |
+| **Angular Material** | ^14.2.7 | UI component library | Pre-built Material Design components (tables, cards, dialogs, date pickers, tooltips, spinners, etc.). |
+| **Bootstrap** | ^5.2.2 | CSS framework | Grid system, utility classes, responsive design. Used alongside Angular Material. |
+| **Ionic Angular** | ^6.4.1 | Cross-platform UI components | Provides icons (`ion-icon`) and some UI primitives shared with mobile apps. |
 
-### 4.2 Authentication & Security
+### Data & Reporting
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| **jsonwebtoken (JWT)** | ^8.5.1 | Industry-standard for stateless authentication. Tokens are self-contained and can be verified without DB lookup. |
-| **bcrypt** | ^5.0.1 | Password hashing (present in dependencies though not actively used in current auth flows — OTP-based auth bypasses password). |
-| **cors** | ^2.8.5 | Cross-Origin Resource Sharing. Allows the frontend (different origin) to access the API. |
+| Technology | Version | Purpose |
+|---|---|---|
+| **DataTables + jQuery** | ^1.13.2 / ^3.6.3 | Server-side-like paginated tables in some views. |
+| **angular-datatables** | ^13.0.0 | Angular wrapper for jQuery DataTables. |
+| **Chart.js** | ^4.4.4 | Data visualization (available but not heavily used currently). |
+| **ExcelJS** | ^4.4.0 | Client-side Excel file generation for report downloads. |
+| **xlsx** | ^0.18.5 | Spreadsheet parsing/generation for bulk upload/download features. |
+| **Moment.js** | ^2.30.1 | Date formatting and manipulation across reports. |
 
-### 4.3 Database
+### UX & Feedback
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| **Mongoose** | ^6.10.0 | ODM for MongoDB. Provides schema validation, model definition, and query building. |
-| **MongoDB / AWS DocumentDB** | — | NoSQL document database. The `ums` (User Management) database stores user documents. DocumentDB is used in dev/staging/prod (AWS-managed MongoDB-compatible). |
-| **Knex** | ^2.0.0 | SQL query builder (present in dependencies and migration scripts, but the active DB is MongoDB. This is a **legacy artifact** from when the service may have used MySQL). |
-| **MySQL** | ^2.18.1 | MySQL driver (legacy dependency, not actively used). |
-| **Objection.js** | ^3.0.1 | ORM for SQL databases (legacy, not actively used). |
+| Technology | Version | Purpose |
+|---|---|---|
+| **ngx-toastr** | ^15.2.2 | Toast notifications for success/error/warning messages across the app. |
+| **SweetAlert2** | ^11.4.8 | Rich modal dialogs for confirmations, alerts, and user prompts. |
+| **ngx-ui-loader** | ^13.0.0 | Global loading spinner that auto-triggers on HTTP calls via `NgxUiLoaderHttpModule`. |
+| **ngx-pagination** | ^6.0.3 | Client-side pagination for paginated lists. |
+| **ng-otp-input** | ^1.8.5 | OTP input component (available, though custom OTP inputs are also used). |
 
-### 4.4 Networking & Proxy
+### Auth & Security
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| **http-proxy-middleware** | ^2.0.6 | Reverse proxy middleware for Express. Forwards requests to the internal load balancer. Supports WebSocket proxying (`ws: true`). |
-| **axios** | ^1.3.4 | HTTP client for inter-service communication (e.g., calling LMS for logistics profile). |
-| **sarvm-utility** | v5.0.3 | Internal shared npm package (from AWS CodeCommit). Provides `Logger`, `ReqLogger`, `ErrorHandler`, `AuthManager`, `HttpResponseHandler`, `apiServices` (inter-service API wrappers like `rms.getAllShopViaUserId`). |
+| Technology | Version | Purpose |
+|---|---|---|
+| **@auth0/angular-jwt** | ^5.1.1 | JWT decoding utilities (available in deps, though `CommonService.parseJwt()` handles decoding manually). |
 
-### 4.5 Utilities
+### Maps
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| **dotenv** | ^16.0.1 | Loads environment variables from `.env` files for local development. |
-| **module-alias** | ^2.2.2 | Enables path aliases (`@controllers`, `@services`, `@db`, etc.) for cleaner import statements. |
-| **joi** | ^17.6.0 | Schema validation library (defined in Validation module but not actively wired into routes). |
-| **morgan** | ^1.10.0 | HTTP request logger (present but commented out in favor of `ReqLogger` from sarvm-utility). |
-| **cuid** | ^3.0.0 | Collision-resistant unique ID generator. Used for session IDs. |
-| **moment** | ^2.29.3 | Date manipulation library (dependency present, likely used in sarvm-utility). |
-| **uuid** | ^8.3.2 | UUID generator (dependency present). |
-| **swagger-ui-express** | ^4.6.0 | Serves the OpenAPI/Swagger documentation UI at `/auth/apis/apidocs`. |
+| Technology | Source | Purpose |
+|---|---|---|
+| **Leaflet** | CDN v1.9.3 | Interactive maps for shop location viewing/editing. Loaded via `index.html` CDN links. |
 
-### 4.6 DevOps & Containerization
+### Build & CI/CD
 
-| Technology | Why |
-|-----------|-----|
-| **Docker** | Multi-stage builds for optimized images. Production uses `node:18.20.5-alpine`. Dev/Staging use private ECR images with `node:17.9.1`. |
-| **AWS ECR** | Private Docker image registry (`326457620362.dkr.ecr.ap-south-1.amazonaws.com`). |
-| **AWS DocumentDB** | MongoDB-compatible managed database service (ap-south-1 region). |
-| **AWS CodeCommit** | Hosts the `sarvm-utility` shared package. |
-| **Nodemon** | Auto-restarts the server on file changes during development. |
+| Technology | Details |
+|---|---|
+| **Angular CLI** | ~14.0.2 — Build, serve, test orchestration. |
+| **Karma + Jasmine** | Unit testing framework (configured but lightly used). |
+| **AWS CodeBuild** | `buildspec.yml` defines CI/CD pipeline: installs Node 16.x, runs `ng build -c=${CURRENT_ENVIRONMENT}`, outputs `dist/admin-panel/`. |
 
-### 4.7 Code Quality
+### Environment-Specific Configuration
 
-| Tool | Why |
-|------|-----|
-| **ESLint** (airbnb-base + prettier) | Enforces consistent code style and catches errors. |
-| **Prettier** | Auto-formats code (120 char width, single quotes, trailing commas). |
+| Environment | `baseUrl` | `environmentKey` | Build Flag |
+|---|---|---|---|
+| **Development** | `https://dev-api.sarvm.ai` | `dev` | `ng build` (default) |
+| **UAT** | `https://uat-api.sarvm.ai` | `uat` | `ng build -c=uat` |
+| **Production** | `https://api.sarvm.ai` | `prod` | `ng build -c=production` |
+
+All environments share the same `unauthToken` (anonymous JWT token) and `app_name: 'admin'` / `app_version_code: '101'`.
 
 ---
 
 ## 5. Project Structure
 
 ```
-auth_service/
-├── .dev.env                          # Dev environment variables (DocumentDB dev cluster)
-├── .stg.env                          # Staging environment variables (DocumentDB UAT cluster)
-├── .prd.env                          # Production environment variables (DocumentDB prod)
-├── .lcl.env                          # Local environment variables (localhost MongoDB)
-├── .env.example                      # Template for environment setup
-├── .dockerignore                     # Docker build exclusions
-├── .eslintrc.json                    # ESLint configuration (airbnb-base + prettier)
-├── .eslintignore                     # ESLint ignore patterns
-├── .prettierrc                       # Prettier configuration
-├── .prettierignore                   # Prettier ignore patterns
-├── .gitignore                        # Git ignore patterns
-├── Dockerfile                        # Production Docker build (node:18.20.5-alpine)
-├── Dockerfile.dev                    # Development Docker build (ECR node:17.9.1)
-├── Dockerfile.staging                # Staging Docker build (ECR node:17.9.1)
-├── README.md                         # Project readme (contains Mermaid diagram link)
-├── jsconfig.json                     # IDE path alias configuration
-├── package.json                      # Dependencies & scripts
-├── package-lock.json                 # Locked dependency tree
-├── server.js                         # ★ ENTRY POINT — Express app, middleware, proxy
+frontend/admin_panel/
+├── angular.json                    # Angular workspace config (build configs, styles, scripts)
+├── buildspec.yml                   # AWS CodeBuild CI/CD pipeline definition
+├── package.json                    # NPM dependencies & scripts
+├── tsconfig.json                   # Root TypeScript config
+├── tsconfig.app.json               # App-specific TS config
+├── tsconfig.spec.json              # Test-specific TS config
+├── karma.conf.js                   # Karma test runner config
 │
-└── src/
-    ├── InitApp/
-    │   └── index.js                  # ★ App bootstrap — DB connect, session, middleware
-    │
-    ├── apis/
-    │   ├── controllers/
-    │   │   └── v1/
-    │   │       ├── Auth.js           # ★ Core controller — getToken, verifyToken, payload builders
-    │   │       └── index.js          # Exports AuthController
-    │   │
-    │   ├── services/
-    │   │   └── v1/
-    │   │       ├── Auth.js           # ★ Token operations — issueToken, verifyToken
-    │   │       ├── Logistic/
-    │   │       │   └── index.js      # ★ Inter-service call to LMS for delivery profile
-    │   │       └── index.js          # Exports AuthService
-    │   │
-    │   ├── routes/
-    │   │   ├── index.js              # ★ Main router — healthcheck, Swagger, v1 mount
-    │   │   └── v1/
-    │   │       ├── Auth.js           # ★ Route definitions — GET /token/:userId, etc.
-    │   │       └── index.js          # Mounts Auth router
-    │   │
-    │   ├── db/
-    │   │   └── index.js              # ★ MongoDB Singleton connection class
-    │   │
-    │   └── models/
-    │       └── Users.js              # ★ Mongoose User schema
-    │
-    ├── common/
-    │   ├── helper/
-    │   │   └── index.js              # Exports AccessEnv (duplicate of utility)
-    │   │
-    │   ├── libs/
-    │   │   ├── AuthManager/
-    │   │   │   └── index.js          # ★ JWT engine — issueTokens, verifyToken, decodeAuthToken, requiresScopes
-    │   │   ├── ErrorHandler/
-    │   │   │   ├── index.js          # ★ AppError class — centralized error handling
-    │   │   │   └── reqToCurl.js      # Converts request to cURL for logging
-    │   │   ├── Logger/
-    │   │   │   └── all-the-logs.log  # Log file (managed by Pino)
-    │   │   ├── Validation/
-    │   │   │   ├── Schemas.js        # Joi validation schema (userSchema)
-    │   │   │   └── Validation.js     # Validation middleware factory
-    │   │   ├── HttpResponseHandler.js# Standard success/error response formatter
-    │   │   ├── RequestHandler.js     # Axios HTTP client wrapper (singleton)
-    │   │   ├── Logger.js             # Simple logger (aliases console)
-    │   │   ├── authorization.js      # Legacy JWT helper (not actively used)
-    │   │   └── index.js              # Exports all libs
-    │   │
-    │   └── utility/
-    │       ├── AccessEnv.js          # ★ Environment variable accessor with cache
-    │       └── index.js              # Exports AccessEnv
-    │
-    ├── config/
-    │   └── index.js                  # ★ Centralized config — reads env vars, exports structured config
-    │
-    ├── constants/
-    │   ├── index.js                  # Aggregates all error constants
-    │   └── errorConstants/
-    │       ├── index.js              # Merges all error categories
-    │       ├── authErrors.js         # Auth errors: ACCESSTOKEN_EXP, REFRESHTOKEN_EXP, UNAUTH_USER
-    │       ├── otpErrors.js          # OTP errors: SEND_OTP_ERROR, VERIFY_OTP_ERROR
-    │       └── serverErrors.js       # Server errors: INTERNAL_SERVER_ERROR, PAGE_NOT_FOUND, etc.
-    │
-    ├── openapi/
-    │   └── openapi.json              # ★ OpenAPI 3.0.3 specification
-    │
-    └── scripts/
-        ├── migrateLatest.js          # Knex migration: run latest (legacy, SQL)
-        ├── migrateMake.js            # Knex migration: create new (legacy, SQL)
-        └── migrateRollback.js        # Knex migration: rollback (legacy, SQL)
+├── src/
+│   ├── index.html                  # SPA entry point (Leaflet CDN, DataTables CDN, FontAwesome)
+│   ├── main.ts                     # Angular bootstrap entry (platformBrowserDynamic)
+│   ├── polyfills.ts                # Browser polyfills
+│   ├── styles.css                  # Global CSS (Material theme, body styles, layout utilities)
+│   ├── favicon.ico                 # App icon
+│   ├── test.ts                     # Karma test bootstrap
+│   │
+│   ├── environments/
+│   │   ├── environment.ts          # Dev config (baseUrl, unauthToken, app_name)
+│   │   ├── environment.prod.ts     # Production config
+│   │   └── environment.uat.ts      # UAT config
+│   │
+│   ├── theme/
+│   │   └── global.scss             # Global SCSS theme variables
+│   │
+│   ├── assets/                     # Static assets (images, SVGs, icons)
+│   │
+│   └── app/
+│       ├── app.module.ts           # Root NgModule (all declarations, imports, providers)
+│       ├── app-routing.module.ts   # All route definitions (flat, no lazy-loading)
+│       ├── app.component.ts/html   # Root component (<app-header> + <router-outlet> + <ngx-ui-loader>)
+│       │
+│       ├── config/
+│       │   └── constants.ts        # API URL registry, localStorage keys, order statuses, validators
+│       │
+│       ├── auth/                   # Authentication components
+│       │   ├── login/              #   Login page (phone number entry → send OTP)
+│       │   └── otp/                #   OTP verification page (4-digit OTP → JWT storage)
+│       │
+│       ├── layout/                 # Persistent layout components
+│       │   ├── header/             #   Top navbar (logo, settings dropdown, logout, offcanvas)
+│       │   └── sidebar/            #   Left sidebar (navigation menu with 12 items)
+│       │
+│       ├── lib/                    # Core library layer
+│       │   ├── guard/
+│       │   │   ├── auth.guard.ts   #   Blocks unauthenticated access → redirects to /login
+│       │   │   └── public.guard.ts #   Blocks authenticated users from login → redirects to /home
+│       │   │
+│       │   ├── pipe/
+│       │   │   ├── filter.pipe.ts  #   Generic object search filter for lists
+│       │   │   ├── language.pipe.ts#   Language display pipe
+│       │   │   └── product-filter.pipe.ts # Product-specific filter
+│       │   │
+│       │   ├── utils/
+│       │   │   └── data.utils.ts   #   Date formatting (Moment.js), empty checks
+│       │   │
+│       │   └── services/
+│       │       ├── api/
+│       │       │   ├── shared/
+│       │       │   │   └── generic.api.ts   # Base HTTP methods (get, post, put, delete)
+│       │       │   └── common.api.ts        # App-specific API methods extending GenericApi
+│       │       │
+│       │       ├── interceptor.service.ts   # HTTP interceptor (Bearer token, app_name, app_version_code)
+│       │       ├── storage.service.ts       # localStorage wrapper (base64 encode/decode)
+│       │       ├── auth.service.ts          # Auth state management (BehaviorSubject), OTP APIs
+│       │       ├── common.service.ts        # JWT parsing, toastr wrappers, user state
+│       │       │
+│       │       ├── retailer.service.ts      # Retailer KYC list, details, status updates
+│       │       ├── catalog.service.ts       # Product/category/catalog CRUD, sync, bulk upload
+│       │       ├── shop-data.service.ts     # Shop CRUD, reverse geocoding
+│       │       ├── shopaddress.service.ts   # Shop listing, search, bulk update, status change
+│       │       ├── order.service.ts         # Order fetching (active, history)
+│       │       ├── employee.service.ts      # Employee details
+│       │       ├── totalentity.service.ts   # Dashboard total counts (shops, retailers, employees)
+│       │       ├── missing-img.service.ts   # Missing image list, status update, upload
+│       │       ├── custom-catalog.service.ts# Custom catalog requests
+│       │       ├── onboard.service.ts       # Onboarding KYC detail fetch, product creation
+│       │       ├── kycdetail.service.ts     # KYC details endpoint
+│       │       ├── logistic-kyc.service.ts  # Logistic KYC list, status update
+│       │       │
+│       │       ├── order-report.service.ts          # Order report generation
+│       │       ├── sellerreport.service.ts          # Seller report, shop status change
+│       │       ├── subscription-report.service.ts   # Subscription report generation
+│       │       ├── subscription-management.service.ts # Subscription management (list/detail)
+│       │       ├── catalog-report.service.ts        # Catalog report generation
+│       │       ├── logistic-report.service.ts       # Logistic report generation
+│       │       ├── referral-report.service.ts       # Referral report generation
+│       │       ├── user-all.service.ts              # All users report
+│       │       ├── ticketreport.service.ts          # Ticket report generation
+│       │       ├── reward-report.service.ts         # Reward report generation
+│       │       ├── deleted-account-report.service.ts# Deleted account report
+│       │       │
+│       │       ├── retailer-requested-product/
+│       │       │   └── retailer-requested-product.service.ts  # Retailer product requests CRUD
+│       │       ├── add-update-product/
+│       │       │   └── add-update-product.service.ts          # Product add/update & request reject
+│       │       └── userCustomer/
+│       │           └── user-customer.service.ts               # User customer report
+│       │
+│       ├── component/              # Feature-specific components
+│       │   ├── catalog/
+│       │   │   ├── catalog/        #   Catalog list + form (CRUD)
+│       │   │   ├── category/       #   Category list + form (CRUD) with routing module
+│       │   │   └── product/        #   Product form + list + bulk upload
+│       │   ├── order/              #   Active orders, order history, track order, shop orders (with own module)
+│       │   ├── profile/            #   Retailer profile list + retailer details
+│       │   ├── retailer-payment-details/  #  Retailer payment status
+│       │   ├── shop-details/       #   Shop details view
+│       │   └── shopData/           #   Shop data CRUD (edit shop, view shop)
+│       │
+│       ├── pages/                  # Full page-level components
+│       │   ├── home/               #   Dashboard (total shops, retailers, employees)
+│       │   ├── emplist/            #   Employee list with search + pagination
+│       │   ├── shop-address-page/  #   Shop list with search, pagination, bulk update
+│       │   ├── retail-kyc-detail/  #   Retailer KYC review detail page
+│       │   ├── logistic-kyc-list/  #   Logistic KYC list + detail page
+│       │   ├── reports/            #   Reports hub (12 report sub-components)
+│       │   ├── request-catalog/    #   Retailer product requests + detail + update
+│       │   ├── custom-catalog/     #   Custom catalog requests + detail page
+│       │   ├── missing-image/      #   Missing product images management
+│       │   ├── categories/         #   S3-sourced category tree viewer
+│       │   ├── subscriptions/      #   Subscription list + detail
+│       │   └── tree/               #   Category data tree visualization
+│       │
+│       ├── shared/                 # Shared/reusable components & directives
+│       │   ├── table/              #   Generic table component with actions (delete, update, status)
+│       │   ├── pagination/         #   Reusable pagination component
+│       │   ├── empservice.service.ts      # Shared employee service
+│       │   ├── number-negative.directive.ts  # Restricts negative number input
+│       │   └── onlynumber.directive.ts       # Restricts input to numbers only
+│       │
+│       └── validator/
+│           └── forbidden-name.directive.ts  # Custom form validator
 ```
-
-### 5.1 Key Files Explained
-
-| File | Purpose | Why It Exists |
-|------|---------|---------------|
-| `server.js` | Creates the Express app, registers middleware (decode, cors, logger), mounts auth routes under `config.node.pathPrefix` (`/auth/apis`), sets up proxy, and starts the HTTP server on port 3200. | It is the **entry point**. The `InitApp` function is called first to bootstrap DB and session, then server.js layers on the routing and proxy. |
-| `src/InitApp/index.js` | Connects to MongoDB (singleton), sets up CLS session namespace (for request-scoped logging), registers middleware. | Separates initialization concerns from routing. The session namespace allows correlating log entries across an async request lifecycle. |
-| `src/apis/controllers/v1/Auth.js` | The brain of the service. Contains `getToken()`, `getUnauthorizeToken()`, `verifyToken()`, `generateToken()`. Also contains payload builders: `generateRetailerData()`, `generateLogisticData()`, `generateAdminData()`, `generateGeneralData()`. | Orchestrates the full token generation workflow — user lookup, cross-service data fetching, payload construction, delegation to service layer. |
-| `src/apis/services/v1/Auth.js` | Thin wrapper around `AuthManager.issueTokens()` and `AuthManager.verifyToken()`. | Provides a service-layer abstraction. If the JWT library or token strategy changes, only this file (and AuthManager) need to change, not the controller. |
-| `src/common/libs/AuthManager/index.js` | The JWT engine. `issueTokens()` signs access + refresh tokens. `verifyToken()` validates a token. `decodeAuthToken()` is Express middleware that decodes on every request. `requiresScopes()` is middleware that checks scope-based authorization. | Centralizes all JWT operations. Used both as local lib and the external `sarvm-utility` package provides its own AuthManager (there is a dual usage). |
-| `src/apis/db/index.js` | Singleton MongoDB connection class. `connect()` bootstraps Mongoose and attaches the `Users` model. `getInstance()` provides access to the connected instance. | Ensures a single DB connection pool is shared across the application. |
-| `src/apis/models/Users.js` | Mongoose schema for the `users` collection. Fields: `username`, `phone` (unique), `refreshTokenTimestamp`, `basicInformation` (personal details, KYC, transaction), `retailerData`, `deliveryData`, `householdData`. | Defines the shape of user documents. The auth_service reads user data from this collection (which is the same `ums` database used by the User Management Service). |
 
 ---
 
 ## 6. Core Functionality
 
-### 6.1 JWT Token Generation (`issueTokens`)
+### 6.1 Authentication & Session Management
 
-**File**: `src/common/libs/AuthManager/index.js` → `issueTokens(payload)`
+**What**: Phone-based OTP authentication with JWT token storage.
 
-**What it does:**
-1. Validates that `payload` is not null/undefined.
-2. Creates an **access token** with these JWT options:
-   - `subject`: `'accessToken'`
-   - `algorithm`: `'HS256'`
-   - `expiresIn`: From env (`365d` in all environments — see Section 11)
-   - `notBefore`: `'120ms'` (token is not valid for the first 120ms after issuance — prevents race conditions)
-   - `issuer`: `'sarvm:ums'`
-3. Creates a **refresh token** with:
-   - Same options but `subject: 'refreshToken'`, `expiresIn: REFRESH_TOKEN_EXPIRESIN` (also `365d`)
-   - **Minimal payload**: Only `{ userId, scope: [] }` — the refresh token intentionally carries no permissions.
-4. Special handling for logistics: If `payload.scope[1] === 'logisticsDelivery'`, the response body includes `{ onbording, subscribed }`.
-5. Returns a frozen (immutable) object: `{ accessToken, refreshToken, body }`.
+**How it works**:
+1. **Login Page** (`/login`): Admin enters a 10-digit Indian mobile number. Form validation enforces numeric-only, 10-digit minimum via `Validators`.
+2. **OTP Delivery**: `AuthService.sendOtp()` calls `POST /ums/apis/v1/users/send_otp/sms`. Supports SMS and voice call OTP resend via `resendOtp()`.
+3. **OTP Verification** (`/otp`): Admin enters a 4-digit OTP across four input fields. Supports paste-to-fill. `AuthService.verifyOtp()` calls `POST /ums/apis/v1/users/verify_otp`.
+4. **Token Storage**: On success, `response.data.accessToken` (JWT) is stored in `localStorage` key `admin-authToken` via `StorageService.set()`. The value is `btoa(escape(JSON.stringify(token)))` encoded.
+5. **Session Bootstrapping**: After token storage, `AuthService.authState` (`BehaviorSubject<boolean>`) is set to `true`, and the page reloads to re-initialise `CommonService.setUserData()` which decodes the JWT to extract user info (e.g., `phone`).
+6. **Logout**: Clears all `localStorage` and navigates to `/login`.
 
-**Why HS256?**
-- HS256 (HMAC-SHA256) is a symmetric signing algorithm. Both signing and verification use the same secret key. This is simpler to manage in a single-service architecture. The tradeoff is that the secret must be securely shared if multiple services need to verify tokens.
+**Why OTP?**: SarvM standardises on phone-based OTP across all apps (consumer, retailer, delivery, admin). No separate password system reduces attack surface.
 
-**Why `notBefore: '120ms'`?**
-- Prevents a client from using the token the instant it's generated. The 120ms window accounts for clock drift and ensures the frontend has time to store the token before making the first authenticated request.
+**API calls**:
+- `POST /ums/apis/v1/users/send_otp/sms` — Send OTP via SMS
+- `POST /ums/apis/v1/users/send_otp/call` — Resend OTP via voice call
+- `POST /ums/apis/v1/users/verify_otp` — Verify OTP, returns JWT
 
-### 6.2 JWT Token Verification (`verifyToken`)
+---
 
-**File**: `src/common/libs/AuthManager/index.js` → `verifyToken(token)`
+### 6.2 Dashboard (Home Page)
 
-**What it does:**
-1. Calls `jwt.verify(token, HS256_TOKEN_SECRET, callback)`.
-2. If verification fails (expired, tampered, malformed), throws the error.
-3. If valid, returns `true`.
+**What**: Landing page after login showing a real-time clock and aggregate platform statistics.
 
-**Where it is called:**
-- In `server.js`, the catch-all `app.all('*')` handler calls `AuthController.verifyToken()` before proxying any request. This ensures that **every proxied request has a valid JWT**.
+**How it works**:
+1. `HomeComponent.ngOnInit()` calls `TotalentityService.getTotalentity()`.
+2. This hits `GET /ums/apis/v1/employee/getTotalEntity` → returns `{ shops, retialers, employees }`.
+3. Three Material cards display these counts.
+4. A greeting message (Good Morning/Afternoon/Evening/Night) is computed from the current hour.
+5. A real-time clock updates every second using RxJS `timer(0, 1000).pipe(map(() => new Date()))`.
 
-### 6.3 JWT Token Decoding (`decodeAuthToken` Middleware)
+**API call**: `GET /ums/apis/v1/employee/getTotalEntity`
 
-**File**: `src/common/libs/AuthManager/index.js` → `decodeAuthToken(req, res, next)`
+---
 
-**What it does:**
-1. Reads `req.headers.authorization`.
-2. If empty/missing, calls `next()` (does not block — unauthenticated requests can still proceed to public routes).
-3. Splits the header: `"accessToken eyJhbGciOiJIUzI1NiIs..."` → subject = `'accessToken'`, token = `'eyJ...'`.
-4. Calls `jwt.verify(token, secret)`.
-5. If valid and `decoded.sub === jwtSubject`, sets `req.authPayload = decoded`.
-6. If expired/invalid:
-   - If subject was `accessToken` → calls `next(new ACCESSTOKEN_EXP_ERROR(err))`.
-   - If subject was `refreshToken` → calls `next(new REFRESHTOKEN_EXP_ERROR(err))`.
+### 6.3 Shop Management
 
-**Why is this middleware, not a route handler?**
-- It runs on **every** request. Downstream routes and controllers can then check `req.authPayload` without needing to decode the token again.
+**What**: Full lifecycle management of retail shops on the platform.
 
-### 6.4 Scope-Based Authorization (`requiresScopes`)
+**Sub-features**:
 
-**File**: `src/common/libs/AuthManager/index.js` → `requiresScopes(scopes)`
+| Feature | Route | Component | API Endpoint | Service |
+|---|---|---|---|---|
+| Shop List | `/shoplist` | `ShopAddressPageComponent` | `GET /rms/apis/v1/shop?limit=&offset=` | `ShopaddressService.getShops()` |
+| Shop Search | `/shoplist` | `ShopAddressPageComponent` | `GET /rms/apis/v1/shop/searchShopByShopIdOrName?shopId=&shopName=&phoneNumber=` | `ShopaddressService.searchShop()` |
+| View Shop | `/view-shop-details/:id` | `ViewShopComponent` | `GET /rms/apis/v2/shop/:id` | `ShopDataService.callShopDataApi()` |
+| Edit Shop | `/edit-shop-data/:id` | `EditShopComponent` | `PUT /rms/apis/v1/shop/:id` | `ShopDataService.updateShopDataApi()` |
+| Shop Details | `/shopDetails/:_id` | `ShopDetailsComponent` | `GET /rms/apis/v1/shop/retailerAndShop/:id` | `RetailerService.getRetailerDetailsById()` |
+| Shop Status Toggle | `/shoplist` | `TableComponent` | `PUT /rms/apis/v1/shop/shopStatus/:userId` | `ShopaddressService.updateBusinessStatus()` |
+| Bulk Product Update | `/bulk-update/:id` | `BulkUpdateComponent` | `PUT /cms/apis/v1/bulkupdate/retailerProducts/:id` | `ShopaddressService.bulkUpdate()` |
+| Shop Products Download | `/shoplist` | `ShopAddressPageComponent` | `GET /cms/apis/v1/retailercatalog/getRetailerProductsDownload/:id` | `ShopaddressService.getDataByShop()` |
+| Reverse Geocoding | Edit Shop | `EditShopComponent` | `GET https://nominatim.openstreetmap.org/reverse.php?lat=&lon=&zoom=18&format=jsonv2` | `ShopDataService.getAddressFormLatlong()` |
 
-**What it does:**
-1. Returns an Express middleware function.
-2. Checks if `req.authPayload` exists (was decoded by `decodeAuthToken`).
-3. Checks if the token's `scope` array has any intersection with the required `scopes`.
-4. If yes → `next()` (authorized).
-5. If no → `next(new UNAUTH_USER)` (forbidden).
+**Why Leaflet?**: The edit shop page uses Leaflet maps for visual shop location editing. The admin can drag a marker to set GPS coordinates, then reverse-geocode via OpenStreetMap Nominatim to auto-fill the address.
 
-**Where it is used:**
-- Not currently wired into any routes in the auth_service itself, but available for use. The `sarvm-utility` package likely uses this pattern in downstream services.
+---
 
-### 6.5 Payload Construction (Per-App Token Payloads)
+### 6.4 Retailer & Logistic KYC Management
 
-The controller builds different JWT payloads depending on the `app_name`:
+**What**: Review, approve, or reject KYC documents submitted by retailers and delivery boys.
 
-#### `generateRetailerData(user, headers, body)` — For `retailerApp`
+**How it works**:
+1. **Retailer KYC List** (`/retailer-profile`): `RetailerService.getRetailerKYCDetailsList()` calls `POST /ums/apis/v1/users/retailerKycData` with pagination, search, and date filters.
+2. **KYC Status Normalisation**: `normalizeKycStatus()` maps raw statuses to canonical values: `Uploaded`, `InProgress`, `Verified`, `Pending`, `Rejected`.
+3. **State Persistence**: `RetailerService` / `LogisticKycService` persist their paginated state (page, pageSize, list data, total count) to `localStorage` so the admin can navigate to a detail page and return without losing their place.
+4. **Detail View** (`/retailer-details/:id`): Shows full retailer profile, KYC docs, shop info.
+5. **Status Update**: `RetailerService.updateRetailerKYCStatus()` calls `POST /onbs/apis/v1/onboarding/retailer/updateRetailerKycStatus`.
+6. **Logistic KYC** follows the identical pattern: `POST /ums/apis/v1/users/logisticKycData` for list, `POST /onbs/apis/v1/onboarding/logistic/updateLogisticKycStatus` for status update.
 
-**Payload fields:**
-| Field | Value | Why |
-|-------|-------|-----|
-| `entityType` | `'SU'` (Shop User) | Identifies the entity type for the platform |
-| `entityId` | `shopId` (from RMS) | Primary entity the user operates on |
-| `userId` | MongoDB `_id` | User identity |
-| `phone` | from User document | User's phone number |
-| `userType` | `'RETAILER'` (overridden by `getUserType`) | App-specific user type |
-| `shopId` | from RMS API | The shop this retailer manages |
-| `shopUniqueId` | from RMS API (`id` field) | Unique shop identifier |
-| `isEmployee` | `userType.includes('EMPLOYEE')` | Whether the user is an employee (sales rep) |
-| `shopMeta` | `{ shop, flag: { onBoarding, isSubscribed, GST_no, isKYCVerified } }` | Full shop metadata and onboarding flags |
-| `segmentId` | `'retailer'` | User segment for analytics/targeting |
-| `flyyUserId` | `"retaile-<flyyUserId>"` (`app_name.slice(0, -3) + '-' + flyyUserId`) | Flyy rewards platform user ID |
-| `scope` | `['Users', 'retailerApp']` | Authorization scope array |
+**API Calls**:
+| Action | Endpoint | Method |
+|---|---|---|
+| List retailer KYC | `/ums/apis/v1/users/retailerKycData` | POST |
+| Update retailer KYC status | `/onbs/apis/v1/onboarding/retailer/updateRetailerKycStatus` | POST |
+| List logistic KYC | `/ums/apis/v1/users/logisticKycData` | POST |
+| Update logistic KYC status | `/onbs/apis/v1/onboarding/logistic/updateLogisticKycStatus` | POST |
+| Get KYC details by userId | `/onbs/apis/v1/onboarding/retailer/kyc/kycDetails/:id` | GET |
 
-**The RMS API call:**
-```javascript
-const shopApiResponse = await getAllShopViaUserId({ headers, body });
-```
-- This calls the Retailer Management Service internally to get the shop details linked to this user.
-- If the user has a shop, the shop data is embedded in the token. If not, `shopId` is `null` and `shopMeta.flag.onBoarding` is `false`.
+---
 
-#### `generateLogisticData(user, headers, body)` — For `logisticsDelivery`
+### 6.5 Product & Catalog Management
 
-**Additional fields:**
-| Field | Value | Why |
-|-------|-------|-----|
-| `entityType` | `'LU'` (Logistics User) | Logistics entity type |
-| `onbording` | from LMS API | Driver's onboarding completion status |
-| `subscribed` | from LMS API | Driver's subscription status |
+**What**: Full CRUD operations on the master product catalog, categories, and catalogs.
 
-**The LMS API call:**
-```javascript
-const { deliveryData } = await logisticInformation(userId);
-// Calls: GET ${INTERNAL_LOAD_BALANCER}/lms/apis/v1/profile/${userId}
-```
+**Sub-features**:
 
-#### `generateAdminData(user, headers, body)` — For `admin`
+| Feature | Route | API Endpoint | Service Method |
+|---|---|---|---|
+| Product List | `/product-list` | `GET /cms/apis/v1/product?q=&page=&pageSize=&categoryId=` | `CatalogService.getProducts()` |
+| Product Search (PSS) | `/product-list` | `GET /pss/apis/v1/adminProductSearch?product=&page=&pageSize=` | `CatalogService.searchProducts()` |
+| Product Create | `/product-form/:id` | `POST /cms/apis/v1/product` | `CatalogService.addProduct()` |
+| Product Update | `/product-form/:id` | `PUT /cms/apis/v1/product/:id` | `CatalogService.updateProductById()` |
+| Product Delete | `/product-list` | `DELETE /cms/apis/v1/product/:id` | `CatalogService.deletProduct()` |
+| Product Image Upload | `/product-form/:id` | `GET /cms/apis/v1/product/image` (pre-signed URL) → `PUT <S3 URL>` | `CatalogService.getPresignedUrl()` + `CatalogService.upload()` |
+| Product Mapping | `/product-form/:id` | `PUT /cms/apis/v1/product/:id/mapping` | `CatalogService.addproductMapping()` |
+| Catalog Tree | `/product-form/:id` | `GET /cms/apis/v1/metadata/mastercatalog` | `CatalogService.getcatalogTreedata()` |
+| Product Sync | `/product-list` | `GET /cms/apis/v1/product/sync` | `CatalogService.syncOperation()` |
+| Bulk Upload | `/bulk-upload` | `POST /cms/apis/v1/bulkupdate` | `CatalogService.bulkUpload()` |
+| Category CRUD | `/category-list`, `/category-form/:id` | `GET/POST/PUT/DELETE /cms/apis/v1/category` | `CatalogService.getCategory()`, etc. |
+| Catalog CRUD | `/catalog-list`, `/catalog-form/:id` | `GET/POST/PUT/DELETE /cms/apis/v1/catalog` | `CatalogService.getCatalogData()`, etc. |
+| Categories (S3) | `/categories` | `GET https://s3.../categoriesList/{env}.json` | `CatalogService.fetchCategories()` |
+| Data Tree | (internal) | `GET /cms/apis/v1/dataTree` | `CatalogService.onGetDataTree()` |
 
-**Additional fields:**
-| Field | Value | Why |
-|-------|-------|-----|
-| `adminData` | `{ status, role }` from `user.adminData` | Admin status and role |
-| `scope` | `['ADMIN']` | Admin-only scope |
+**Image Upload Flow**:
+1. Client requests a pre-signed S3 URL: `GET /cms/apis/v1/product/image` → returns `{ url: "https://s3...?Signature=..." }`
+2. Client uploads the file directly to S3: `PUT <pre-signed URL>` with `FormData` (bypasses interceptor via `skip` header).
+3. The S3 key path is stored in the product record.
 
-#### `generateGeneralData(user, headers, body)` — Fallback for other apps
+---
 
-- Used for `householdApp` and any other app not explicitly handled.
-- Standard payload without shop/logistics/admin data.
+### 6.6 Request Catalog & Custom Catalog
 
-### 6.6 Segment Determination (`getSegment`)
+**What**: Manages product requests from retailers ("I want to sell product X") and custom catalog field requests.
 
-Maps the user's `app_name` and `userType` to a segment identifier used for analytics and targeting:
+| Feature | Route | API | Service |
+|---|---|---|---|
+| Request Catalog List | `/request-catalog` | `GET /cms/apis/v1/newProductReq?page=&limit=` | `RetailerRequestedProductService.getProduct()` |
+| Request Detail | `/product-detail/:id` | `GET /cms/apis/v1/newProductReq/:id` | `RetailerRequestedProductService.getProductById()` |
+| Update Request | `/update-product/:id` | `PUT /cms/apis/v1/newProductReq/:id` | `RetailerRequestedProductService.updateProduct()` |
+| Add/Update from Request | `/update-product/:id` | `PUT /cms/apis/v1/retailercatalog/updateProducts` | `AddUpdateProductService.updateProduct()` |
+| Reject Request | `/update-product/:id` | `PUT /cms/apis/v1/newProductReq/updateProductRequestStatus` | `AddUpdateProductService.rejectRequest()` |
+| Custom Catalog List | `/custom-catalog` | `GET /cms/apis/v1/customCatalog?page=&limit=` | `CustomCatalogService.getCustomRequests()` |
+| Custom Catalog Update | `/custom-catalog-detail/:id` | `PUT /cms/apis/v1/customCatalog/updateCustomFieldsStatus/:shopId` | `CustomCatalogService.updateRequest()` |
 
-| app_name | userType | segmentId |
-|----------|----------|-----------|
-| `retailerApp` | any | `'retailer'` |
-| `householdApp` | `EMPLOYEE_SH` | `'sales_employee_sh'` |
-| `householdApp` | `EMPLOYEE_SSO` | `'sales_employee_sso'` |
-| `householdApp` | `EMPLOYEE_CO` | `'sales_employee_co'` |
-| `householdApp` | default | `'household'` |
-| `logisticsDelivery` | any | `'logistics_delivery'` |
-| `admin` | active | `user.adminData.role` |
-| `admin` | inactive | `'non-admin'` |
-| other | — | throws `INTERNAL_SERVER_ERROR` |
+---
 
-### 6.7 User Type Mapping (`getUserType`)
+### 6.7 Missing Images
 
-Overrides the database `userType` based on the requesting application:
+**What**: Product images flagged as missing by the system. Admins can review, update status, or upload replacement images.
 
-| app_name | Returned userType |
-|----------|-------------------|
-| `retailerApp` | `'RETAILER'` |
-| `logisticsDelivery` | `'LOGISTICS_DELIVERY'` |
-| `admin` | `'ADMIN'` |
-| other | Original `userType` from DB |
+| Action | API | Service Method |
+|---|---|---|
+| List missing images | `GET /cms/apis/v1/product/missingImagesList?page=&pageSize=&q=` | `MissingImgService.getMissingImage()` |
+| Update image status | `POST /cms/apis/v1/product/missingImageStatusUpdate` | `MissingImgService.updateImageStatus()` |
+| Upload replacement image | `POST /cms/apis/v1/retailercatalog/uploadMissingImage` (FormData) | `MissingImgService.uploadMissingImage()` |
 
-### 6.8 Health Check
+---
 
-**Endpoint**: `GET /auth/apis/healthcheck`
+### 6.8 Order Management
 
-Returns:
-```json
-{
-  "success": true,
-  "data": {
-    "ts": "2026-04-11T10:00:00.000Z",
-    "buildNumber": "101"
-  }
-}
-```
+**What**: View and track orders across the platform.
 
-**Why?** Used by load balancers and monitoring systems to verify the service is running. Returns the current timestamp and build number.
+| Feature | Route | API | Service |
+|---|---|---|---|
+| Active Orders | `/active-orders` | `GET /hms/apis/v1/orders/` | `OrderService.getOrders()` |
+| Order History | `/order-history` | `GET /rms/apis/v1/orders?status=ALL` | `OrderService.getOrderHistory()` |
+| Track Order | `/track-order/:id` | (Component-level) | (Component-level) |
+| Shop Orders | `/shop-orders/:id` | `GET /rms/apis/v1/orders/:id` | (Component-level) |
+
+**Order Statuses** (defined in `Constants.ORDER_STATUS`):
+- `1`: NEW → `2`: ACCEPTED → `3`: PROCESSING → `4`: READY → `5`: DISPATCH → `6`: DELIVERED
+- `7`: CANCELLED, `8`: REJECTED
+
+---
+
+### 6.9 Employee Management
+
+**What**: View the list of all SarvM employees with search and pagination.
+
+| Action | API | Service |
+|---|---|---|
+| Employee list | `GET /ums/apis/v1/employee/allEmp?q=&page=&pageSize=` | `CatalogService.getemployeeDetails()` |
+| Employee detail | `GET /ums/apis/v1/employee/allEmp/:id` | `EmployeeService.getEmployee()` |
+
+---
+
+### 6.10 Subscription Management
+
+**What**: View and manage retailer subscriptions on the platform.
+
+| Feature | Route | API | Service |
+|---|---|---|---|
+| Subscription List | `/subscriptions` | `GET /sub/apis/v1/subscription/payment/history/all?phone=&userType=&page=&size=` | `SubscriptionManagementService.getUsersSubscriptionList()` |
+| Subscription Detail | `/subscriptions-detail/:id` | `GET /sub/apis/v1/subscription/payment/history/:id` | `SubscriptionManagementService.getUserSubscriptionDetails()` |
+| Create Subscription | (internal) | `POST /sub/apis/v1/subscription/initiate` | `CommonApi.createSubscription()` |
+| Confirm Subscription | (internal) | `POST /sub/apis/v1/subscription/activate` | `CommonApi.confirmSubscription()` |
+
+---
+
+### 6.11 Reporting Hub
+
+**What**: A single `/reports` page that acts as a hub, rendering one of 13 report sub-components based on which card the admin clicks.
+
+**Architecture**: `ReportsComponent` uses `activeComponent` string state + `*ngIf` directives to dynamically show/hide report sub-components. The `/retailer-pending-payout` route reuses `ReportsComponent` with route data `{ activate: 'retailer-pending-payout', hideReportTiles: true }`.
+
+| Report | Sub-Component | API Endpoint | Service |
+|---|---|---|---|
+| **Users** | `UserAllComponent` | `POST /ums/apis/v1/users/getUsersDataCsv` | `UserAllService.getUserAll()` |
+| **Sellers** | `SellerReportComponent` | `POST /rms/apis/v1/shop/userSellerReport` | `SellerreportService.getSellerReport()` |
+| **Orders** | `OrderReportComponent` | `POST /oms/apis/v1/orders/orderReport` | `OrderReportService.getOrderReport()` |
+| **Subscriptions** | `SubscriptionReportComponent` | `POST /rms/apis/v1/shop/subscriptionReport` | `SubscriptionReportService.getSubscriptionReport()` |
+| **Logistic** | `LogisticComponent` | `POST /lms/apis/v1/deliveryBoy/getDeliveryBoysCsv` | `LogisticReportService.getLogistic()` |
+| **Catalog** | `CatalogReportComponent` | `POST /cms/apis/v1/retailercatalog/getCatalogueReport` | `CatalogReportService.getCatalog()` |
+| **Referral** | `ReferralReportComponent` | `POST /ref_ms/apis/v1/report/getCleanReferralCsv` | `ReferralReportService.getReferral()` |
+| **User Customer** | `UserCustomerComponent` | `POST /ums/apis/v1/users/getUserCustomerDataCsv` | `UserCustomerService.getUserCustomer()` |
+| **Ticket** | `TicketReportComponent` | `POST /ums/apis/v1/Tickets/ticketsReport` | `TicketReportService.getTicketReport()` |
+| **Reward** | `RewardReportComponent` | `POST /ref_ms/apis/v1/report/rewardReport` | `RewardReportService.getRewardReport()` |
+| **Deleted Account** | `DeletedAccountReportComponent` | `POST /ums/apis/v1/users/deletedAccountReport` | `DeletedAccountReportService.getDeletedAccountReport()` |
+| **Withdrawal Data** | `WithdrawalRequestComponent` | (Wallet APIs) | (Wallet service calls) |
+| **Retailer Pending Payout** | `RetailerPendingPayoutComponent` | `GET /wlt/api/reconcile/retailer-pending-payouts` | (Wallet service) |
+
+All reports support:
+- **Date range filtering** (`startDate`, `endDate`)
+- **Pagination** (`page`, `pageSize`)
+- **Text search filter** (`filter`)
+- **Language filter** (`selectedLanguage`) — where applicable
+
+---
+
+### 6.12 Wallet & Payout Management
+
+**What**: Manages retailer payouts and settlement processing.
+
+| Action | API | Method |
+|---|---|---|
+| Pending Payouts | `GET /wlt/api/reconcile/retailer-pending-payouts` | GET |
+| Process Settlement | `PUT /wlt/api/settlements/:retailerId/:safeUtr?adminUser=:adminUser` | PUT |
+| Settlement History | `GET /wlt/api/settlements/history` | GET |
+
+---
+
+### 6.13 Retailer Payment Details
+
+**What**: View payment status for a specific retailer.
+
+| Action | API | Service |
+|---|---|---|
+| Payment Status | `GET /pmt/apis/v1/razorpay/payment/getPaymentStatus/:id` | `RetailerService.getRetailerPaymentDetails()` |
 
 ---
 
 ## 7. APIs & Integrations
 
-### 7.1 Exposed APIs (Auth Service Endpoints)
+### 7.1 Complete API Endpoint Registry
 
-#### `GET /auth/apis/v1/token/:userId`
+All endpoints are relative to `environment.baseUrl` unless otherwise noted.
 
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Generate authenticated JWT tokens for a verified user |
-| **When called** | After successful OTP verification by the User Management Service |
-| **Path params** | `userId` — MongoDB ObjectId of the user |
-| **Required headers** | `app_name` (e.g., `retailerApp`), `app_version_code` (e.g., `101`), `Authorization` (existing JWT) |
-| **Response** | `{ success: true, data: { accessToken, refreshToken, body } }` |
-| **Calls internally** | MongoDB (User lookup), RMS `getAllShopViaUserId` (for retailerApp), LMS `/lms/apis/v1/profile/:userId` (for logisticsDelivery) |
-| **Error cases** | User not found → `INTERNAL_SERVER_ERROR`, RMS/LMS call failure → `INTERNAL_SERVER_ERROR` |
+#### UMS — User Management Service (`/ums/`)
 
-#### `GET /auth/apis/v1/unauth_token`
+| Endpoint | Method | Purpose | Called By |
+|---|---|---|---|
+| `/ums/apis/v1/users/send_otp/sms` | POST | Send OTP via SMS | `AuthService.sendOtp()` |
+| `/ums/apis/v1/users/send_otp/call` | POST | Resend OTP via voice call | `AuthService.resendOtp()` |
+| `/ums/apis/v1/users/verify_otp` | POST | Verify OTP, returns JWT | `AuthService.verifyOtp()` |
+| `/ums/apis/v1/users` | GET | Get users list | `UserService` |
+| `/ums/apis/v1/users?type=retailer` | GET | Get retailer users | `RetailerService.getRetailerDetails()` |
+| `/ums/apis/v1/users?userIds=:id` | GET | Get retailer profile by ID | `CommonApi.getRetailerProfileDetails()` |
+| `/ums/apis/v1/users/getUsersDataCsv` | POST | All users report | `UserAllService.getUserAll()` |
+| `/ums/apis/v1/users/getUserCustomerDataCsv` | POST | User customer report | `UserCustomerService.getUserCustomer()` |
+| `/ums/apis/v1/users/retailerKycData` | POST | Retailer KYC data list | `RetailerService.getRetailerKYCDetailsList()` |
+| `/ums/apis/v1/users/logisticKycData` | POST | Logistic KYC data list | `LogisticKycService.getLogisticKYCDetailsList()` |
+| `/ums/apis/v1/users/deletedAccountReport` | POST | Deleted account report | `DeletedAccountReportService` |
+| `/ums/apis/v1/employee/allEmp` | GET | Employee list | `CatalogService.getemployeeDetails()` |
+| `/ums/apis/v1/employee/allEmp/:id` | GET | Employee detail | `EmployeeService.getEmployee()` |
+| `/ums/apis/v1/employee/getTotalEntity` | GET | Dashboard totals | `TotalentityService.getTotalentity()` |
+| `/ums/apis/v1/Tickets/ticketsReport` | POST | Ticket report | `TicketReportService.getTicketReport()` |
 
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Generate anonymous JWT tokens for unauthenticated access |
-| **When called** | On app launch, before the user logs in |
-| **Required headers** | `app_name`, `app_version_code` |
-| **Response** | `{ success: true, data: { accessToken, refreshToken, body } }` |
-| **Payload** | `{ userId: 'anonymous', scope: [app_name] }` |
+#### RMS — Retailer Management Service (`/rms/`)
 
-#### `POST /auth/apis/v1/token`
+| Endpoint | Method | Purpose | Called By |
+|---|---|---|---|
+| `/rms/apis/v1/shop` | GET | List shops (paginated) | `ShopaddressService.getShops()` |
+| `/rms/apis/v1/shop/:id` | PUT | Update shop data | `ShopDataService.updateShopDataApi()` |
+| `/rms/apis/v2/shop/:id` | GET | Get shop details v2 | `ShopDataService.callShopDataApi()` |
+| `/rms/apis/v1/shop/retailerAndShop/:id` | GET | Get retailer & shop combined | `RetailerService.getRetailerDetailsById()` |
+| `/rms/apis/v1/shop/searchShopByShopIdOrName` | GET | Search shops | `ShopaddressService.searchShop()` |
+| `/rms/apis/v1/shop/shopStatus/:userId` | PUT | Update shop open/close status | `ShopaddressService.updateBusinessStatus()` |
+| `/rms/apis/v1/shop/userSellerReport` | POST | Seller report | `SellerreportService.getSellerReport()` |
+| `/rms/apis/v1/shop/subscriptionReport` | POST | Subscription report | `SubscriptionReportService` |
+| `/rms/apis/v1/shop/users/:id` | GET | KYC details by user ID | `CommonApi` |
+| `/rms/apis/v1/orders/` | GET | Retail orders | `OrderService` |
+| `/rms/apis/v1/orders?status=ALL` | GET | Order history | `OrderService.getOrderHistory()` |
 
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Generate JWT tokens from an arbitrary payload |
-| **When called** | Internal/programmatic token generation |
-| **Request body** | Any JSON payload to embed in the JWT |
-| **Response** | `{ success: true, data: { accessToken, refreshToken, body } }` |
+#### CMS — Catalog Management Service (`/cms/`)
 
-#### `GET /auth/apis/healthcheck`
+| Endpoint | Method | Purpose | Called By |
+|---|---|---|---|
+| `/cms/apis/v1/product` | GET/POST | List/Create products | `CatalogService` |
+| `/cms/apis/v1/product/:id` | GET/PUT/DELETE | Product CRUD by ID | `CatalogService` |
+| `/cms/apis/v1/product/image` | GET | Get pre-signed S3 URL | `CatalogService.getPresignedUrl()` |
+| `/cms/apis/v1/product/:id/mapping` | PUT | Update product-category mapping | `CatalogService.addproductMapping()` |
+| `/cms/apis/v1/product/sync` | GET | Sync products to search index | `CatalogService.syncOperation()` |
+| `/cms/apis/v1/product/missingImagesList` | GET | Missing images list | `MissingImgService` |
+| `/cms/apis/v1/product/missingImageStatusUpdate` | POST | Update missing image status | `MissingImgService` |
+| `/cms/apis/v1/category` | GET/POST/PUT/DELETE | Category CRUD | `CatalogService` |
+| `/cms/apis/v1/catalog` | GET/POST/PUT/DELETE | Catalog CRUD | `CatalogService` |
+| `/cms/apis/v1/catalog/image` | GET | Category/Catalog image pre-signed URL | `CatalogService` |
+| `/cms/apis/v1/metadata/mastercatalog` | GET | Master catalog tree | `CatalogService.getcatalogTreedata()` |
+| `/cms/apis/v1/dataTree` | GET | Data tree for categories | `CatalogService.onGetDataTree()` |
+| `/cms/apis/v1/bulkupdate` | POST | Bulk product upload | `CatalogService.bulkUpload()` |
+| `/cms/apis/v1/bulkupdate/retailerProducts/:id` | PUT | Bulk update retailer products | `ShopaddressService.bulkUpdate()` |
+| `/cms/apis/v1/retailercatalog/getRetailerProductsDownload/:id` | GET | Download retailer products | `ShopaddressService.getDataByShop()` |
+| `/cms/apis/v1/retailercatalog/updateProducts` | PUT | Update retailer products | `AddUpdateProductService.updateProduct()` |
+| `/cms/apis/v1/retailercatalog/getCatalogueReport` | POST | Catalog report | `CatalogReportService` |
+| `/cms/apis/v1/retailercatalog/uploadMissingImage` | POST | Upload missing image | `MissingImgService.uploadMissingImage()` |
+| `/cms/apis/v1/newProductReq` | GET | Requested products list | `RetailerRequestedProductService` |
+| `/cms/apis/v1/newProductReq/:id` | GET/PUT | Get/Update product request | `RetailerRequestedProductService` |
+| `/cms/apis/v1/newProductReq/updateProductRequestStatus` | PUT | Reject product request | `AddUpdateProductService.rejectRequest()` |
+| `/cms/apis/v1/customCatalog` | GET | Custom catalog requests | `CustomCatalogService` |
+| `/cms/apis/v1/customCatalog/updateCustomFieldsStatus/:shopId` | PUT | Update custom catalog status | `CustomCatalogService` |
 
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Service health check |
-| **Response** | `{ success: true, data: { ts, buildNumber } }` |
+#### Other Services
 
-#### `GET /auth/apis/apidocs`
+| Service | Endpoint | Method | Purpose |
+|---|---|---|---|
+| **OMS** | `/oms/apis/v1/orders/orderReport` | POST | Order report generation |
+| **HMS** | `/hms/apis/v1/orders/` | GET | Household orders |
+| **HMS** | `/hms/apis/v1/households/splash` | GET | Splash/language data |
+| **SUB** | `/sub/apis/v1/subscription/` | GET | Get subscription by ID |
+| **SUB** | `/sub/apis/v1/subscription/initiate` | POST | Create subscription |
+| **SUB** | `/sub/apis/v1/subscription/activate` | POST | Confirm subscription |
+| **SUB** | `/sub/apis/v1/subscription/payment/history` | GET | Subscription history (list/detail) |
+| **LMS** | `/lms/apis/v1/deliveryBoy/getDeliveryBoysCsv` | POST | Logistic report |
+| **PMT** | `/pmt/apis/v1/razorpay/payment/getPaymentStatus/:id` | GET | Payment status |
+| **WLT** | `/wlt/api/reconcile/retailer-pending-payouts` | GET | Pending payouts |
+| **WLT** | `/wlt/api/settlements/:retailerId/:safeUtr` | PUT | Process settlement |
+| **WLT** | `/wlt/api/settlements/history` | GET | Settlement history |
+| **REF_MS** | `/ref_ms/apis/v1/report/getCleanReferralCsv` | POST | Referral report |
+| **REF_MS** | `/ref_ms/apis/v1/report/rewardReport` | POST | Reward report |
+| **PSS** | `/pss/apis/v1/adminProductSearch` | GET | Product search (Elasticsearch) |
+| **ONBS** | `/onbs/apis/v1/onboarding/retailer/kyc` | GET | Retailer KYC details |
+| **ONBS** | `/onbs/apis/v1/onboarding/retailer/kyc/kycDetails/:id` | GET | KYC details by user |
+| **ONBS** | `/onbs/apis/v1/onboarding/retailer/updateRetailerKycStatus` | POST | Update retailer KYC |
+| **ONBS** | `/onbs/apis/v1/onboarding/logistic/updateLogisticKycStatus` | POST | Update logistic KYC |
 
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Swagger UI for API documentation |
-| **Response** | Interactive OpenAPI documentation page |
+### 7.2 External Integrations
 
-### 7.2 Proxy Endpoints (Pass-Through)
+| Integration | URL | Purpose |
+|---|---|---|
+| **OpenStreetMap Nominatim** | `https://nominatim.openstreetmap.org/reverse.php` | Reverse geocoding (lat/lng → address). Used in shop editing. |
+| **AWS S3** | `https://s3.ap-south-1.amazonaws.com/dev.sarvm.com/categoriesList/{env}.json` | Fetch master category hierarchy JSON file. |
+| **AWS S3 Pre-signed URLs** | Dynamic S3 URLs | Direct file upload for product/category/catalog images. |
+| **Leaflet CDN** | `https://unpkg.com/leaflet@1.9.3/` | Map tiles for shop location management. |
+| **FontAwesome CDN** | `https://kit.fontawesome.com/a076d05399.js` | Icon library. |
+| **DataTables CDN** | `https://cdn.datatables.net/1.13.2/` | DataTable JS/CSS for legacy table views. |
 
-Any request not matching `/auth/apis/*` is proxied to `INTERNAL_LOAD_BALANCER` after JWT verification:
+### 7.3 HTTP Interceptor Details
 
-| Request Path Pattern | Proxied To | Target Service |
-|---------------------|------------|----------------|
-| `/rms/apis/v1/*` | `INTERNAL_LB/rms/apis/v1/*` | Retailer Management Service |
-| `/ums/apis/v1/*` | `INTERNAL_LB/ums/apis/v1/*` | User Management Service |
-| `/oms/apis/v1/*` | `INTERNAL_LB/oms/apis/v1/*` | Order Service |
-| `/cms/apis/v1/*` | `INTERNAL_LB/cms/apis/v1/*` | Catalogue Management Service |
-| `/lms/apis/v1/*` | `INTERNAL_LB/lms/apis/v1/*` | Logistics Management Service |
-| `/whs/*` | `INTERNAL_LB/whs/*` | WebSocket/Warehouse Service (no auth) |
+The `InterceptorService` sits at the core of all HTTP communication:
 
-### 7.3 Consumed APIs (Outbound Calls)
-
-#### `sarvm-utility` → `apiServices.rms.getAllShopViaUserId`
-
-| Attribute | Value |
-|-----------|-------|
-| **Called from** | `AuthController.generateRetailerData()` |
-| **Why** | Fetch shop details (shop_id, KYC, subscription, GST) to embed in the retailer's JWT payload |
-| **Input** | `{ headers: { Content-Type, Accept, app_name, app_version_code, Authorization }, body: { userId } }` |
-| **Output** | `{ success: true, data: [{ shop_id, id, isKYCVerified, isSubscribed, GST_no, ... }] }` |
-
-#### `axios` → `GET ${INTERNAL_LOAD_BALANCER}/lms/apis/v1/profile/:userId`
-
-| Attribute | Value |
-|-----------|-------|
-| **Called from** | `Logistic/index.js` → `logisticInformation(userId)` |
-| **Why** | Fetch logistics delivery profile for drivers to include onboarding and subscription status in their JWT |
-| **Input** | `userId` as path parameter |
-| **Output** | `{ data: { deliveryData: { onbording, subscribed } } }` |
-
-### 7.4 OpenAPI Specification
-
-The service provides an OpenAPI 3.0.3 specification at `src/openapi/openapi.json` and serves it via Swagger UI at `/auth/apis/apidocs`.
-
-**Servers defined:**
-| Environment | URL |
-|-------------|-----|
-| Local | `http://localhost:3200/` |
-| Production | `https://api.sarvm.ai/` |
-| Staging (UAT) | `https://uat-api.sarvm.ai/` |
-
-**Schemas defined:**
-- `Token`: `{ success: boolean, data: { accesstoken: string, refreshtoken: string } }`
-- `Success`: `{ success: boolean, data: object }`
-- `Error`: `{ success: false, error: { code: string, originalError: string, message: string } }`
+```
+Every HTTP Request
+  ├── Has token in localStorage?
+  │   ├── YES → Attach headers: Authorization: Bearer <token>, app_name, app_version_code
+  │   └── NO  → Attach unauthToken from environment config
+  ├── Has 'skip' header?
+  │   ├── YES → Remove 'skip' header, do NOT attach auth headers (for S3, CDN calls)
+  │   └── NO  → Normal flow
+  └── Error Handling
+      ├── HTTP 0 or 503 → (Maintenance page redirect - commented out)
+      └── Other errors → Re-throw for component-level handling
+```
 
 ---
 
 ## 8. Database Design
 
-### 8.1 Database Details
+The Admin Panel is a **frontend-only** application. It does **not** have its own database. All data is fetched from and persisted to backend microservices via REST APIs. However, `localStorage` serves as the client-side persistence layer:
 
-| Property | Value |
-|----------|-------|
-| **Database Engine** | MongoDB (AWS DocumentDB in cloud environments) |
-| **Database Name** | `ums` (User Management System) |
-| **Collection** | `users` |
-| **ODM** | Mongoose v6.10.0 |
-| **Connection Pattern** | Singleton class (`db` class with static instance) |
+### 8.1 localStorage Schema
 
-### 8.2 User Schema
+| Key | Value Format | Purpose | Set By | Read By |
+|---|---|---|---|---|
+| `admin-authToken` | `btoa(escape(JSON.stringify(JWT)))` | Authenticated user's JWT | `OtpComponent` | `StorageService`, `InterceptorService`, `AuthGuard`, `PublicGuard`, `CommonService`, `HeaderComponent` |
+| `admin-authUser` | Base64-encoded JSON | User profile data | (Available for future use) | — |
+| `phonenumber` | Plain string | Mobile number (login → OTP page transfer) | `LoginComponent` | `OtpComponent` |
+| `retailerServiceState` | JSON `{ currentPage, currentIndex, pageSize, retailerKYCList, totalRetailers }` | Paginated retailer KYC state | `RetailerService.saveState()` | `RetailerService.loadState()` |
+| `logisticKycServiceState` | JSON `{ currentPage, currentIndex, pageSize, logisticKYCList, totalDeliveryBoys }` | Paginated logistic KYC state | `LogisticKycService.saveState()` | `LogisticKycService.loadState()` |
 
-**File**: `src/apis/models/Users.js`
+### 8.2 StorageService Encoding
 
-```javascript
-const UserSchema = new mongoose.Schema({
-  username:               { type: String },
-  phone:                  { type: String, required: true, unique: true },
-  refreshTokenTimestamp:  { type: Number, required: true, default: Math.round(new Date().getTime() / 1000) },
-  basicInformation: {
-    personalDetails: {
-      firstName:              String,
-      lastName:               String,
-      FathersName:            String,
-      DOB:                    Date,
-      Gender:                 String,
-      secondaryMobileNumber:  String,
-      emailID:                String,
-    },
-    kycDetails:       { kycId: String },
-    transactionDetails: { transactionDetailsId: String },
-  },
-  retailerData:   {},   // Flexible sub-document for retailer-specific data
-  deliveryData:   {},   // Flexible sub-document for delivery-specific data
-  householdData:  {},   // Flexible sub-document for household-specific data
-});
+All values stored via `StorageService.set()` / `setItem()` are encoded as:
+```
+btoa(escape(JSON.stringify(value)))
+```
+And decoded on read via:
+```
+JSON.parse(unescape(atob(storedValue)))
 ```
 
-### 8.3 Field-by-Field Explanation
+**Why base64?**: Provides basic obfuscation of token values in browser DevTools. Not encryption—just a deterrent against casual inspection.
 
-| Field | Type | Required | Why |
-|-------|------|----------|-----|
-| `username` | String | No | Display name (not used in auth flow) |
-| `phone` | String | Yes, unique | Primary identifier for OTP-based auth. Unique constraint ensures no duplicate accounts. |
-| `refreshTokenTimestamp` | Number | Yes | Unix timestamp. Can be used to invalidate refresh tokens by comparing against token issuance time. Default is current time at document creation. |
-| `basicInformation.personalDetails` | Object | No | User's personal info. Not used in auth_service directly, but exists on the shared User document. |
-| `basicInformation.kycDetails` | Object | No | KYC verification ID. Referenced indirectly when shopMeta.isKYCVerified is checked. |
-| `basicInformation.transactionDetails` | Object | No | Payment/transaction reference. Not used in auth flow. |
-| `retailerData` | Mixed | No | Placeholder for retailer-specific data. Schema-less to allow flexibility. |
-| `deliveryData` | Mixed | No | Placeholder for delivery driver data. The auth_service reads `deliveryData` from the LMS API, not directly from this field. |
-| `householdData` | Mixed | No | Placeholder for household user data. |
+### 8.3 Backend Data Entities (Referenced)
 
-**Additional fields from user document (not explicitly in schema but accessed via `user.toObject()`):**
-- `userType` — e.g., `'RETAILER'`, `'EMPLOYEE_SH'`, `'EMPLOYEE_SSO'`, `'EMPLOYEE_CO'`
-- `flyyUserId` — Flyy rewards platform integration
-- `adminData` — `{ status: 'active'/'inactive', role: 'admin'/'superadmin'/etc. }` (accessed as `user._doc.adminData`)
+While the admin panel doesn't own these, it interacts with the following backend entities:
 
-### 8.4 Database Connection Flow
-
-```mermaid
-sequenceDiagram
-    participant App as server.js
-    participant Init as InitApp
-    participant DB as db class (Singleton)
-    participant Mongoose as Mongoose
-    participant DocDB as AWS DocumentDB
-
-    App->>Init: InitApp(app)
-    Init->>DB: new DB()
-    Note right of DB: Constructor checks db.instance<br/>If null, sets db.instance = this
-    Init->>DB: db.connect()
-    DB->>Mongoose: mongoose.set('strictQuery', true)
-    DB->>Mongoose: mongoose.connect(MONGO_URL)
-    Mongoose->>DocDB: TCP connection
-    DocDB-->>Mongoose: Connected
-    Mongoose-->>DB: 'Mongodb Connected successfully'
-    DB->>DB: this.Users = UserModel (attach model)
-
-    Note over App,DocDB: Later, in controller:
-    App->>DB: db.getInstance()
-    DB-->>App: { Users: UserModel }
-    App->>Mongoose: Users.findById(userId)
-    Mongoose->>DocDB: Query
-    DocDB-->>App: User document
-```
-
-### 8.5 Connection URIs by Environment
-
-| Environment | URI Pattern | Database |
-|-------------|-------------|----------|
-| Local | `mongodb://localhost:27017/ums` | Local MongoDB |
-| Dev | `mongodb://sarvmdev:***@dev-db.cluster-*.docdb.amazonaws.com/ums?retryWrites=false` | AWS DocumentDB (dev cluster) |
-| Staging (UAT) | `mongodb://sarvmUATRead:***@uat.cluster-*.docdb.amazonaws.com/ums?retryWrites=false` | AWS DocumentDB (UAT cluster) |
-| Production | `[]` (placeholder) | AWS DocumentDB (prod cluster) |
-
-> **Note**: `retryWrites=false` is required for AWS DocumentDB, which does not support retryable writes (a MongoDB 3.6+ feature).
+| Entity | Service | Key Fields |
+|---|---|---|
+| **User** | UMS | `_id`, `phone`, `userType`, `selectedLanguage`, `createdAt` |
+| **Shop** | RMS | `shop_id`, `shop_name`, `user_id`, `city`, `pincode`, `latitude`, `longitude`, `selling_type`, `shop_status` |
+| **Product** | CMS | `_id`, `name`, `image`, `price`, `qty`, `unit`, `soldBy`, `categoryId` |
+| **Category** | CMS | `_id`, `name`, `parentId`, `image` |
+| **Catalog** | CMS | `_id`, `name`, `image` |
+| **Order** | OMS/RMS | `orderId`, `status`, `amount`, `buyerId`, `sellerId`, `items[]`, `orderCreatedAt` |
+| **Subscription** | SUB | `userId`, `shopId`, `amount`, `paid`, `type`, `subscriptionStartDate`, `subscriptionEndDate` |
+| **KYC** | ONBS | `userId`, `kycStatus`, `kycInformation`, documents |
+| **Delivery Boy** | LMS | `logisticId`, `phone`, `vehicleType`, `totalTrips`, `totalearnings` |
+| **Referral** | REF_MS | `ref_by`, `refToId`, `type`, `kyc_status`, `sub_status` |
+| **Ticket** | UMS | `userId`, `ticketStatus`, `drawId`, `isTicketVerified` |
+| **Wallet/Settlement** | WLT | `retailerId`, `safeUtr`, settlement amounts |
 
 ---
 
 ## 9. Setup & Installation
 
-### 9.1 Prerequisites
+### Prerequisites
+- **Node.js**: v16.x (as specified in `buildspec.yml`)
+- **npm**: Bundled with Node.js
+- **Angular CLI**: v14.0.0 (`npm install -g @angular/cli@14.0.0`)
 
-- **Node.js** >= 18.x (recommended: 18.20.5)
-- **MongoDB** (local) or access to AWS DocumentDB
-- **npm** (comes with Node.js)
-- Access to `sarvm-utility` package (requires AWS CodeCommit credentials)
-
-### 9.2 Environment Variables
-
-Create a `.env` file based on `.env.example`:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `NODE_ENV` | Runtime environment | `development` |
-| `ENV` | Environment name | `dev` / `stg` / `prd` |
-| `BUILD_NUMBER` | Build identifier | `101` |
-| `HOST` | Server host | `localhost` |
-| `HOST_PORT` | Server port | `3200` |
-| `HOST_SERVICE_NAME` | Service name (used in URL prefix) | `auth` |
-| `MONGO_URL` | MongoDB connection string | `mongodb://localhost:27017/ums` |
-| `HS256_TOKEN_SECRET` | JWT signing secret | `sarvm` |
-| `ACCESS_TOKEN_EXPIRESIN` | Access token TTL | `365d` |
-| `REFRESH_TOKEN_EXPIRESIN` | Refresh token TTL | `365d` |
-| `INTERNAL_LOAD_BALANCER` | Internal service mesh URL | `http://localhost` |
-| `LOAD_BALANCER` | Public load balancer URL | `http://localhost` |
-| `PINO_LOG_LEVEL` | Logging level | `info` |
-| `SESSION_NAME` | CLS session namespace name | `logger_session` |
-
-### 9.3 Installation Steps
+### Local Development
 
 ```bash
 # 1. Clone the repository
 git clone <repo-url>
-cd backend/auth_service
+cd frontend/admin_panel
 
 # 2. Install dependencies
-npm install
+npm install --legacy-peer-deps
 
-# 3. Set up environment
-cp .env.example .lcl.env
-# Edit .lcl.env with your local configuration
+# 3. Start development server (uses environment.ts → dev-api.sarvm.ai)
+ng serve
+# App runs at http://localhost:4200
 
-# 4. Start the server (local development)
-npm run lcl
+# 4. For UAT environment
+ng serve -c=uat
 
-# 5. Start with dev environment
-npm run lcl:dev
-
-# 6. Start with staging environment
-npm run lcl:stg
-
-# 7. Start with production environment
-npm run lcl:prd
+# 5. For production build
+ng build -c=production
+# Output: dist/admin-panel/
 ```
 
-### 9.4 NPM Scripts
+### Build Configurations (angular.json)
 
-| Script | Command | Description |
-|--------|---------|-------------|
-| `lcl` | `nodemon -r dotenv/config ./server dotenv_config_path=./.lcl.env` | Local dev with local MongoDB |
-| `lcl:dev` | `nodemon -r dotenv/config ./server dotenv_config_path=./.dev.env` | Local dev with dev DocumentDB |
-| `lcl:stg` | `nodemon -r dotenv/config ./server dotenv_config_path=./.stg.env` | Local dev with staging DocumentDB |
-| `lcl:prd` | `nodemon -r dotenv/config ./server dotenv_config_path=./.prd.env` | Local dev with prod DocumentDB |
-| `prd` | `nodemon ./server` | Production (env vars injected by container) |
-| `stg` | `nodemon ./server` | Staging (env vars injected by container) |
-| `test` | `mocha ./unitTests/ --recursive` | Run unit tests (with 8GB heap) |
-| `mdb-latest-dev` | `node -r dotenv/config ./src/scripts/migrateLatest.js ...` | Run Knex migrations (legacy) |
-| `mdb-make-lcl` | `node -r dotenv/config ./src/scripts/MigrateMake.js ...` | Create Knex migration (legacy) |
-| `mdb-rollback-dev` | `node -r dotenv/config ./src/scripts/migrateRollback.js ...` | Rollback Knex migrations (legacy) |
+| Config | Optimizations | Source Maps | File Replacement |
+|---|---|---|---|
+| **development** | None (fast builds) | Yes | `environment.ts` (default) |
+| **uat** | Default | Default | `environment.ts` → `environment.uat.ts` |
+| **production** | Full (output hashing, budgets: 2MB warn / 5MB error) | No | `environment.ts` → `environment.prod.ts` |
 
-### 9.5 Docker Build
+### CI/CD Pipeline (AWS CodeBuild)
 
-```bash
-# Production build
-docker build -t auth-service:latest \
-  --build-arg BUILD_NUMBER=101 \
-  -f Dockerfile .
-
-# Dev build
-docker build -t auth-service:dev \
-  --build-arg BUILD_NUMBER=101 \
-  -f Dockerfile.dev .
-
-# Staging build
-docker build -t auth-service:staging \
-  --build-arg BUILD_NUMBER=101 \
-  -f Dockerfile.staging .
+```yaml
+# buildspec.yml
+phases:
+  install:
+    runtime-versions:
+      nodejs: 16.x
+    commands:
+      - npm install --legacy-peer-deps
+      - npm install -g @angular/cli@14.0.0
+  build:
+    commands:
+      - ng build -c=${CURRENT_ENVIRONMENT}
+artifacts:
+  files: "**/*"
+  base-directory: dist/admin-panel
 ```
 
-**Docker architecture (multi-stage):**
-1. **Build stage**: Uses full Node image, runs `npm ci` to install dependencies.
-2. **Runtime stage**: Uses Alpine-based image, copies built `node_modules` and `src/`.
-3. **Exposed port**: `3200`.
-4. **Start command**: `NODE_ENV=production npm run-script stg` (production) / `NODE_ENV=development npm run-script stg` (dev/staging).
+The `CURRENT_ENVIRONMENT` variable is set at the CodeBuild project level to `development`, `uat`, or `production`.
 
-### 9.6 Module Aliases
+### Global Styles & Scripts (loaded via angular.json)
 
-The service uses `module-alias` to provide clean import paths:
+**Stylesheets** (in order):
+1. `src/styles.css` — Global CSS (body, utility classes)
+2. `src/theme/global.scss` — SCSS theme variables
+3. `bootstrap/dist/css/bootstrap.css` — Bootstrap grid & utilities
+4. `datatables.net-bs5/css/dataTables.bootstrap5.min.css` — DataTable styling
+5. `sweetalert2/src/sweetalert2.scss` — SweetAlert2 styles
+6. `ngx-toastr/toastr.css` — Toast notification styles
 
-| Alias | Maps To | Usage |
-|-------|---------|-------|
-| `@root` | `.` | Project root |
-| `@controllers` | `src/apis/controllers` | `require('@controllers/v1')` |
-| `@services` | `src/apis/services` | `require('@services/v1')` |
-| `@db` | `src/apis/db` | `require('@db')` |
-| `@models` | `src/apis/models` | `require('@models/Users')` |
-| `@routes` | `src/apis/routes` | `require('@routes')` |
-| `@constants` | `src/constants` | `require('@constants')` |
-| `@config` | `src/config` | `require('@config')` |
-| `@common` | `src/common` | `require('@common/libs')` |
+**Scripts** (in order):
+1. `bootstrap.bundle.min.js` — Bootstrap JS
+2. `jquery.min.js` — jQuery (required by DataTables)
+3. `jquery.dataTables.min.js` — DataTables core
+4. `dataTables.bootstrap5.min.js` — DataTables Bootstrap 5 integration
 
 ---
 
 ## 10. User Flow
 
-### 10.1 Complete Authentication Lifecycle
+### 10.1 Complete Login → Dashboard Flow
 
 ```mermaid
-graph TD
-    A["App Launch"] --> B["Request Anonymous Token"]
-    B --> C["GET /auth/apis/v1/unauth_token"]
-    C --> D["Receive { accessToken, refreshToken }<br/>userId: 'anonymous'"]
-    D --> E["User Enters Phone Number"]
-    E --> F["OTP Request via UMS<br/>(proxied through auth_service)"]
-    F --> G["OTP Verified via UMS<br/>(proxied through auth_service)"]
-    G --> H["UMS returns userId"]
-    H --> I["Request Authenticated Token"]
-    I --> J["GET /auth/apis/v1/token/:userId"]
-    J --> K["Auth Service looks up user in MongoDB"]
-    K --> L{"Which app?"}
-    
-    L -->|retailerApp| M["Call RMS for shop data"]
-    L -->|logisticsDelivery| N["Call LMS for delivery profile"]
-    L -->|admin| O["Read adminData from user doc"]
-    L -->|other| P["Use general payload"]
-    
-    M --> Q["Build retailer JWT payload"]
-    N --> R["Build logistics JWT payload"]
-    O --> S["Build admin JWT payload"]
-    P --> T["Build general JWT payload"]
-    
-    Q --> U["Sign JWT tokens"]
-    R --> U
-    S --> U
-    T --> U
-    
-    U --> V["Return { accessToken, refreshToken }"]
-    V --> W["Frontend stores tokens"]
-    W --> X["All subsequent API calls include<br/>Authorization: accessToken <jwt>"]
-    X --> Y["Auth Service verifies token"]
-    Y --> Z["Proxy to internal service"]
-    Z --> AA["Service processes request"]
-    AA --> AB["Response back through proxy"]
+flowchart TD
+    A[Open Admin Panel URL] --> B{Has valid token?}
+    B -->|No| C[Redirect to /login]
+    B -->|Yes| D[Show /home dashboard]
+    C --> E[Enter mobile number]
+    E --> F{Valid 10-digit number?}
+    F -->|No| G[Show validation error]
+    F -->|Yes| H[POST send_otp/sms]
+    H --> I{OTP sent?}
+    I -->|No| J[Show error toast]
+    I -->|Yes| K[Navigate to /otp]
+    K --> L[Enter 4-digit OTP]
+    L --> M{Valid OTP?}
+    M -->|No| N[Show error toast]
+    M -->|Yes| O[Store JWT in localStorage]
+    O --> P[page reload]
+    P --> D
+    D --> Q[Display greeting + clock + entity counts]
 ```
 
-### 10.2 Step-by-Step: Retailer App Login
+### 10.2 Sidebar Navigation Map
 
-| Step | Actor | Action | Why |
-|------|-------|--------|-----|
-| 1 | App | Launches and calls `GET /auth/apis/v1/unauth_token` with `app_name: retailerApp` | Needs a token to make any backend call, even unauthenticated ones |
-| 2 | Auth Service | Issues anonymous JWT with `userId: 'anonymous'`, `scope: ['retailerApp']` | Anonymous token allows the app to call UMS for OTP |
-| 3 | App | Sends OTP request via `POST /ums/apis/v1/otp/send` (proxied through auth) | User enters phone number |
-| 4 | Auth Service | Verifies anonymous token, then proxies to UMS | Gateway performs auth check before forwarding |
-| 5 | UMS | Sends OTP via SMS | User receives OTP on phone |
-| 6 | App | Submits OTP via `POST /ums/apis/v1/otp/verify` (proxied through auth) | User enters OTP |
-| 7 | UMS | Verifies OTP, creates/finds user, returns `userId` | OTP verification is handled by UMS, not auth_service |
-| 8 | App | Calls `GET /auth/apis/v1/token/:userId` | Requests authenticated tokens |
-| 9 | Auth Service | Looks up user in `ums.users` collection | Needs user data (phone, userType, flyyUserId) for JWT payload |
-| 10 | Auth Service | Calls RMS `getAllShopViaUserId` | Needs shop data for the retailer's JWT |
-| 11 | Auth Service | Builds retailer payload, signs JWT | Creates access + refresh tokens |
-| 12 | App | Receives and stores tokens | All future requests use these tokens |
-| 13 | App | Makes API calls (e.g., `GET /rms/apis/v1/shop/list`) | Authorization header: `accessToken <jwt>` |
-| 14 | Auth Service | Decodes JWT, verifies token, proxies to RMS | Every request goes through auth gatekeeper |
-| 15 | RMS | Processes request, returns response | Response flows back through the proxy |
+```mermaid
+flowchart LR
+    Sidebar --> Home["/home — Dashboard"]
+    Sidebar --> ShopList["/shoplist — Shop List"]
+    Sidebar --> RetailerProfile["/retailer-profile — Retailer KYC"]
+    Sidebar --> LogisticProfile["/logistic-profile — Logistic KYC"]
+    Sidebar --> EmployeeList["/app-emplist — Employee List"]
+    Sidebar --> ProductList["/product-list — Product List"]
+    Sidebar --> Reports["/reports — Reports Hub"]
+    Sidebar --> RequestCatalog["/request-catalog — Request Catalog"]
+    Sidebar --> MissingImages["/missing-images — Missing Images"]
+    Sidebar --> CustomCatalog["/custom-catalog — Custom Catalog"]
+    Sidebar --> RetailerPayout["/retailer-pending-payout — Payout"]
+    Sidebar --> Categories["/categories — Categories"]
+    Sidebar --> Subscriptions["/subscriptions — Subscriptions"]
+```
 
-### 10.3 Token Refresh Flow
+### 10.3 KYC Review Flow
 
-> **Note:** The current codebase does not have an explicit **refresh token endpoint**. The refresh token is issued but there is no `/auth/apis/v1/refresh` endpoint. The current approach relies on the very long token expiry (365 days) which effectively makes tokens perpetual. A proper refresh mechanism is listed in [Future Improvements](#13-future-improvements).
+```mermaid
+flowchart TD
+    A[Retailer Profile page] --> B[View KYC list with status badges]
+    B --> C{Search/Filter?}
+    C -->|Yes| D[Search by phone/name, filter by date]
+    D --> B
+    C -->|No| E[Click on a retailer row]
+    E --> F[Navigate to /retailer-details/:id]
+    F --> G[View KYC documents & shop info]
+    G --> H{Action?}
+    H -->|Approve| I[POST updateRetailerKycStatus - Verified]
+    H -->|Reject| J[POST updateRetailerKycStatus - Rejected]
+    H -->|Back| K[Return to list - state preserved in localStorage]
+```
+
+### 10.4 Report Generation Flow
+
+```mermaid
+flowchart TD
+    A["/reports page"] --> B[Click report card - e.g. Sellers]
+    B --> C[SellerReportComponent renders]
+    C --> D[Set date range + filters]
+    D --> E["POST /rms/apis/v1/shop/userSellerReport"]
+    E --> F[Data displayed in Material table]
+    F --> G{Export?}
+    G -->|Yes| H[Generate Excel via ExcelJS/xlsx]
+    G -->|No| I[Navigate pages via pagination]
+    I --> E
+```
 
 ---
 
 ## 11. Edge Cases & Limitations
 
-### 11.1 Security Concerns
+### Authentication
+| Edge Case | Current Behavior | Notes |
+|---|---|---|
+| **Token expiry** | No automatic refresh or expiry detection. The `InterceptorService` does not check for 401 responses. | If the JWT expires, API calls silently fail until the user manually logs out and re-authenticates. |
+| **Multiple tabs** | Each tab reads from the same `localStorage`. Logout in one tab clears the token, but other tabs won't detect it until their next API call. | No cross-tab communication mechanism exists. |
+| **unauthToken expiry** | The anonymous token has an `exp` field. If it expires, unauthenticated endpoints (send OTP) will fail. | Must be manually rotated in the environment config files. |
 
-| Issue | Description | Impact |
-|-------|-------------|--------|
-| **365-day token expiry** | Both access and refresh tokens expire after 365 days. This is effectively a permanent token. | If a token is compromised, the attacker has up to a year of access. Industry standard is 15-30 minutes for access tokens and hours/days for refresh tokens. |
-| **Hardcoded JWT secret** | The `HS256_TOKEN_SECRET` is `sarvm` across all environments. | A known/simple secret defeats the purpose of JWT signing. Anyone who knows the secret can forge tokens. |
-| **No token revocation** | There is no mechanism to invalidate issued tokens. The `refreshTokenTimestamp` field exists in the User schema but is not checked during verification. | A compromised token cannot be revoked until it expires. |
-| **No rate limiting** | No rate limiting on token generation endpoints. | Susceptible to brute-force attempts. |
+### Data & State
+| Edge Case | Current Behavior |
+|---|---|
+| **localStorage full** | `StorageService.set()` uses `await localStorage.setItem()` but doesn't catch `QuotaExceededError`. Would silently fail. |
+| **Base64 decode failures** | `StorageService.getItem()` uses `atob()` which throws on invalid base64. No try-catch wrapper. |
+| **Concurrent state writes** | `RetailerService` and `LogisticKycService` write paginated state to `localStorage`. Concurrent writes (e.g., two rapid navigations) could cause race conditions. |
+| **`phonenumber` in localStorage** | The phone number is stored as a plain string (not base64-encoded) via `localStorage.setItem('phonenumber', ...)` directly, inconsistent with the `StorageService` pattern. |
 
-### 11.2 Code Issues
+### Routing
+| Edge Case | Current Behavior |
+|---|---|
+| **No lazy loading** | All 40+ components are eagerly loaded. Initial bundle size can be large. |
+| **Missing AuthGuard on some routes** | `/kycdetails`, `/missing-images`, `/categories`, `/subscriptions`, `/subscriptions-detail/:id`, `/logistic-profile`, `/logistic-detail/:id` have **no** `AuthGuard`. These routes are technically accessible without authentication. |
+| **`shop-orders/:id`** has `canActivate: []` — explicitly empty guard array, meaning no auth check. |
 
-| Issue | Description | Impact |
-|-------|-------------|--------|
-| **Duplicate middleware** | `InitApp/index.js` and `server.js` both register `decodeAuthToken`, `cors()`, `urlencoded()`, and `ReqLogger`. | Every request passes through these middleware **twice**, causing unnecessary overhead and potential double-logging. |
-| **Dual AuthManager** | The service imports `AuthManager` from both `sarvm-utility` (in `server.js` and `InitApp`) and local `@common/libs/AuthManager` (in `services/v1/Auth.js`). | Two different AuthManager implementations could cause inconsistencies if they diverge. |
-| **Legacy SQL dependencies** | `knex`, `mysql`, `objection` are in `package.json` but the service uses MongoDB. Migration scripts reference a non-existent `../knex/knex` path. | Dead code and unnecessary dependency weight (~2MB+). |
-| **Missing token refresh endpoint** | No endpoint to exchange a refresh token for a new access token. | Clients must re-authenticate (full OTP flow) when tokens expire, or rely on the 365-day expiry. |
-| **Unused validation** | Joi schemas and validation middleware exist but are not wired into any route. | No request validation on any endpoint — any malformed request reaches the controller. |
-| **`authorization.js` — Dead code** | `src/common/libs/authorization.js` contains a standalone JWT implementation with hardcoded keys. It references `req` without it being in scope. | Non-functional dead code. |
-| **`package.json` name mismatch** | `package.json` has `"name": "user_mgmt_service"` instead of `auth_service`. | Misleading, likely copied from user_mgmt_service template. |
-| **No request body parsing for JSON** | `express.json()` is commented out in both `InitApp` and `server.js`. Only `urlencoded` is enabled. | POST requests sending JSON bodies (e.g., `POST /token`) may not be parsed correctly. |
-| **Error response inconsistency** | `verifyToken()` in the catch-all proxy throws `INTERNAL_SERVER_ERROR` for invalid tokens, which returns HTTP 500. | Invalid tokens should return 401 (Unauthorized), not 500. |
-
-### 11.3 Architectural Edge Cases
-
-| Case | Behavior |
-|------|----------|
-| **User deleted after token issued** | Token remains valid until expiry. No re-validation against DB on each request (stateless JWT). |
-| **Shop deleted/changed after token issued** | JWT payload is stale — shopId, shopMeta are embedded at token generation time. Client must re-request a token. |
-| **Database unavailable** | `getToken()` will throw `INTERNAL_SERVER_ERROR`. The proxy flow (`verifyToken`) does not require DB, only JWT signature verification. |
-| **Internal load balancer down** | All proxy requests fail. Token generation for retailer/logistics apps also fails (cross-service calls). |
-| **Unknown `app_name`** | `getSegment()` throws `INTERNAL_SERVER_ERROR`. `getUserType()` returns the raw DB `userType`. |
-| **`/whs/*` requests** | Proxied **without any authentication**. Any client can make WebSocket connections without a token. |
-| **Concurrent token requests** | No locking. Multiple valid tokens can be issued simultaneously for the same user. |
+### API
+| Edge Case | Current Behavior |
+|---|---|
+| **No retry logic** | Failed API calls are not retried. The interceptor re-throws errors for component-level handling. |
+| **No offline support** | The app has no service worker or offline cache. Network loss = broken experience. |
+| **Mixed HTTP methods for similar actions** | Some reports use POST (sending params in body), while shop listing uses GET (params in query string). Inconsistent but functional. |
 
 ---
 
 ## 12. Performance & Scalability
 
-### 12.1 Current Performance Characteristics
+### Current Performance Characteristics
 
-| Aspect | Current State |
-|--------|---------------|
-| **Stateless auth** | JWT verification requires no DB lookup (just signature validation). This makes the proxy path extremely fast. |
-| **DB connection pooling** | Singleton Mongoose connection with default pool settings. No custom pool configuration (`min`/`max`). |
-| **Token generation latency** | Depends on cross-service calls. For retailerApp: 1 DB query + 1 HTTP call to RMS. For logisticsDelivery: 1 DB query + 1 HTTP call to LMS. |
-| **Proxy overhead** | Minimal — `http-proxy-middleware` streams the request/response without buffering. |
-| **Memory** | Node.js single-threaded. No clustering or worker threads configured. |
+| Aspect | Status | Details |
+|---|---|---|
+| **Bundle Size** | ⚠️ Warning at 2MB, error at 5MB | No lazy-loading. All routes/components loaded upfront. Large vendor chunk (Bootstrap + Material + jQuery + DataTables + Ionic). |
+| **Initial Load** | Moderate | SPA loads all JS at once. `NgxUiLoaderHttpModule` shows a spinner during API calls but not during bundle download. |
+| **API Calls** | No caching | Every navigation re-fetches data. No `shareReplay()`, `BehaviorSubject` caching, or HTTP cache headers used (except for the `time$` observable in HomeComponent). |
+| **DOM Performance** | Adequate | `*ngIf`-based component switching in Reports avoids rendering all 13 sub-components simultaneously. Pagination limits visible rows. |
+| **Memory** | Adequate | No known memory leaks. Services are singleton (`providedIn: 'root'`). |
 
-### 12.2 Bottlenecks
+### Scalability Considerations
 
-| Bottleneck | Why |
-|-----------|-----|
-| **Single-threaded Node.js** | Under heavy load, the single event loop may become saturated. No clustering (`pm2`, `cluster` module) is configured. |
-| **Cross-service calls during token gen** | `getToken()` for retailerApp makes a synchronous HTTP call to RMS. If RMS is slow, token generation is slow. |
-| **No caching** | User data and shop data are fetched from DB/services on every token request. No Redis/in-memory cache. |
-| **Duplicate middleware execution** | Every request runs decode, cors, urlencoded, and logging twice. |
-| **No connection pool tuning** | Default Mongoose pool size may be insufficient under heavy load. |
+| Scenario | Current Impact | Recommendation |
+|---|---|---|
+| **Growing report datasets** | Server-side pagination already implemented. Client handles display only. | Backend must maintain query performance as data grows. |
+| **More admin features** | All features in one `AppModule`. File grows linearly. | Implement lazy-loaded feature modules. |
+| **More concurrent admins** | No impact — purely client-side, talks to shared API gateway. | Backend rate limiting may be needed. |
+| **Larger image uploads** | Direct-to-S3 via pre-signed URLs. No server bottleneck. | Already well-designed. |
 
-### 12.3 Scalability Strategies
+### Bundle Optimisation Opportunities
 
-| Strategy | Current | Recommended |
-|----------|---------|-------------|
-| **Horizontal scaling** | Docker containers (potentially on ECS/EKS) | Add auto-scaling based on CPU/request metrics |
-| **Caching** | None | Add Redis cache for user data, shop data (TTL: 5-10 minutes) |
-| **Token verification** | Every request | Consider moving to API Gateway (AWS API Gateway, Kong) for token verification at the edge |
-| **Connection pooling** | Default | Configure `pool: { min: 5, max: 20 }` in Mongoose |
-| **Clustering** | None | Use `pm2` or Node.js `cluster` module to utilize all CPU cores |
-| **Circuit breaking** | None | Add circuit breaker (e.g., `opossum`) for RMS/LMS calls |
+1. **Lazy Loading**: Split routes into feature modules (`OrderModule` already exists as a pattern) and lazy-load them.
+2. **Remove jQuery**: Used only for DataTables. Replace with Angular-native table solutions (Angular Material table already in use).
+3. **Tree-shake Moment.js**: Replace with `date-fns` or Angular's built-in `DatePipe` to reduce vendor chunk.
+4. **Remove duplicate dependencies**: Both CDN and npm-bundled versions of jQuery/DataTables exist.
 
 ---
 
 ## 13. Future Improvements
 
-### 13.1 Critical (Security)
+### High-Priority
 
-1. **Reduce token expiry**: Change access token to 15-30 minutes, refresh token to 7-30 days.
-2. **Implement refresh token endpoint**: `POST /auth/apis/v1/refresh` that accepts a refresh token and returns a new access token.
-3. **Strengthen JWT secret**: Replace `sarvm` with a cryptographically random 256-bit secret. Use per-environment secrets.
-4. **Token revocation**: Check `refreshTokenTimestamp` against the token's `iat` (issued-at) during verification. If the user's timestamp is newer, reject the token.
-5. **Rate limiting**: Add rate limiting middleware (e.g., `express-rate-limit`) on token generation endpoints.
+| Improvement | Why | Impact |
+|---|---|---|
+| **Add 401 interceptor handling** | JWT expiry goes undetected; users see cryptic API errors instead of being redirected to login. | Critical for UX. Auto-logout or token refresh on 401. |
+| **Add `AuthGuard` to all protected routes** | 6+ routes lack guards, allowing unauthenticated access to KYC details, images, categories, subscriptions. | Security vulnerability. |
+| **Implement lazy loading** | Current bundle includes all components. As the admin panel grows, initial load time will degrade. | Performance. Split into `AuthModule`, `ShopModule`, `ReportModule`, `CatalogModule`, etc. |
+| **Centralised error handling** | Errors are handled inconsistently—some components use toastr, others use SweetAlert, some do nothing. | UX consistency. Create a global error handler service. |
 
-### 13.2 High Priority (Architecture)
+### Medium-Priority
 
-6. **Remove duplicate middleware**: Consolidate InitApp and server.js middleware chains. Remove the duplicate `decodeAuthToken`, `cors()`, `urlencoded()`, and `ReqLogger` registrations.
-7. **Enable JSON body parsing**: Uncomment `express.json({ limit: '1mb' })` so POST endpoints work correctly.
-8. **Unify AuthManager**: Use either `sarvm-utility`'s AuthManager or the local one, not both.
-9. **Return 401 for invalid tokens**: Change `verifyToken()` to throw a proper `UNAUTH_USER` error (HTTP 401) instead of `INTERNAL_SERVER_ERROR` (HTTP 500).
-10. **Secure `/whs/*` route**: Add authentication to the WebSocket proxy or at minimum validate the origin.
+| Improvement | Why |
+|---|---|
+| **Role-based access control (RBAC)** | Currently all admin users see all features. As the team grows, different roles (ops, support, catalog team) should see different sidebar items and have different permissions. |
+| **State management (NgRx or Akita)** | `localStorage`-based state in services is fragile. A proper state management library would centralise and make state predictable. |
+| **Comprehensive unit tests** | Test files exist (`.spec.ts`) but most are boilerplate. Critical services (auth, interceptor, retailer, catalog) need robust test coverage. |
+| **Replace Moment.js** | Moment.js is in maintenance mode and adds ~300KB to the bundle. `date-fns` or `dayjs` are modern, tree-shakeable alternatives. |
+| **Upgrade Angular** | Angular 14 is past end-of-life. Upgrading to Angular 17+ brings performance improvements, standalone components, and security patches. |
 
-### 13.3 Medium Priority (Code Quality)
+### Low-Priority
 
-11. **Remove legacy SQL dependencies**: Remove `knex`, `mysql`, `objection`, and the migration scripts.
-12. **Fix `package.json` name**: Change from `user_mgmt_service` to `auth_service`.
-13. **Remove dead code**: Delete `authorization.js`, clean up commented-out code blocks.
-14. **Wire up validation**: Use the existing Joi schemas and validation middleware in route definitions.
-15. **Add unit tests**: The `test` script exists but the `unitTests/` directory is missing.
-
-### 13.4 Low Priority (Nice-to-Have)
-
-16. **Add request/response logging for proxy**: Log which internal service handled each proxied request.
-17. **Add OpenAPI spec for proxy endpoints**: Document all proxied endpoints in the OpenAPI spec.
-18. **Environment-specific configs**: Ensure production has different secrets, shorter token expiry, and proper logging configuration.
-19. **Health check improvements**: Add MongoDB connection status, memory usage, and uptime to the health check response.
-20. **Monitoring**: Add APM (Application Performance Monitoring) integration (commented-out code suggests this was planned).
+| Improvement | Why |
+|---|---|
+| **Offline support** | Service worker for basic caching of static assets. Not critical for an internal tool, but improves resilience. |
+| **Audit logging** | Track which admin performed which action (KYC approve/reject, shop status change, product delete). Currently no audit trail on the frontend. |
+| **Dark mode** | Current design uses a light theme. A toggle for dark mode would improve extended-use ergonomics. |
+| **Responsive design improvements** | Offcanvas sidebar exists for mobile, but some pages (especially report tables) may not render well on small screens. |
 
 ---
 
 ## 14. Summary
 
-### 14.1 What the Auth Service Is
+The **SarvM Admin Panel** is a comprehensive Angular 14 single-page application functioning as the operational backbone of the SarvM marketplace platform. It enables internal administrators to:
 
-The Sarvm Auth Service is a **dual-purpose Node.js/Express application** that functions as both an **authentication provider** and an **API gateway (reverse proxy)** for the Sarvm microservices ecosystem.
+- **Authenticate** via phone-based OTP (UMS service)
+- **Monitor** platform health via a real-time dashboard with entity counts
+- **Manage** shops, products, categories, and catalogs with full CRUD operations (RMS + CMS services)
+- **Review** retailer and logistic KYC documents with approve/reject workflows (UMS + ONBS services)
+- **Track** orders and view detailed order reports (OMS + RMS services)
+- **Generate** 13 different reports across users, sellers, orders, subscriptions, logistics, catalogs, referrals, tickets, rewards, deleted accounts, and wallet data
+- **Process** retailer payouts via the wallet settlement system (WLT service)
+- **Handle** product requests, custom catalog requests, and missing image resolution
 
-### 14.2 Key Responsibilities
-
-| # | Responsibility | Implementation |
-|---|---------------|----------------|
-| 1 | **Token Generation** | JWT access + refresh tokens via `AuthManager.issueTokens()`. App-aware payloads (retailer, logistics, admin, general). |
-| 2 | **Token Verification** | JWT signature verification via `AuthManager.verifyToken()`. Runs on every proxied request. |
-| 3 | **Token Decoding** | Express middleware `decodeAuthToken()` decodes JWT and attaches payload to `req.authPayload`. |
-| 4 | **API Gateway** | `http-proxy-middleware` forwards authenticated requests to internal services via `INTERNAL_LOAD_BALANCER`. |
-| 5 | **Cross-Service Enrichment** | Calls RMS (shop data) and LMS (logistics profile) to build rich JWT payloads during token generation. |
-
-### 14.3 Architecture Summary
+### Architecture Summary
 
 ```
-Clients → Auth Service (Port 3200) → Internal Load Balancer → Microservices
-                 │
-                 ├── /auth/apis/v1/token/:userId   → Generate JWT
-                 ├── /auth/apis/v1/unauth_token     → Anonymous JWT
-                 ├── /auth/apis/v1/token (POST)     → Custom JWT
-                 ├── /auth/apis/healthcheck         → Health check
-                 ├── /whs/*                         → Proxy (no auth)
-                 └── * (everything else)            → Verify JWT → Proxy
+┌──────────────────────────────────────────────────────────────┐
+│                     ADMIN PANEL (Angular 14 SPA)             │
+│                                                              │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │   Auth    │  │    Layout     │  │     Feature Pages     │   │
+│  │ login/otp │  │ header/sidebar│  │ 30+ pages/components  │   │
+│  └──────────┘  └──────────────┘  └──────────────────────┘   │
+│                         │                                    │
+│  ┌──────────────────────┴────────────────────────────────┐   │
+│  │              25+ Feature Services                      │   │
+│  │  (RetailerService, CatalogService, ReportServices...) │   │
+│  └───────────────────────┬───────────────────────────────┘   │
+│                          │                                   │
+│  ┌───────────────────────┴───────────────────────────────┐   │
+│  │         CommonApi → GenericApi → HttpClient            │   │
+│  │         InterceptorService (Bearer token)              │   │
+│  │         StorageService (localStorage base64)           │   │
+│  └───────────────────────┬───────────────────────────────┘   │
+└──────────────────────────┼───────────────────────────────────┘
+                           │ HTTPS
+                           ▼
+              ┌────────────────────────┐
+              │     API Gateway        │
+              │  (dev/uat/prod)        │
+              └────────────┬───────────┘
+                           │
+    ┌──────┬───────┬───────┼───────┬───────┬───────┬──────┐
+    │ UMS  │  RMS  │  CMS  │  OMS  │  LMS  │  SUB  │ WLT  │
+    │ PMT  │REF_MS │  PSS  │  HMS  │  ONBS │       │      │
+    └──────┴───────┴───────┴───────┴───────┴───────┴──────┘
+              12 Backend Microservices
 ```
 
-### 14.4 Technology Choices
-
-- **JWT (HS256)** for stateless, scalable authentication
-- **MongoDB/DocumentDB** for user data persistence
-- **http-proxy-middleware** for transparent reverse proxying
-- **sarvm-utility** for shared auth, logging, and error handling infrastructure
-- **Docker multi-stage builds** for optimized container images
-- **AWS infrastructure** (DocumentDB, ECR, CodeCommit, internal ALB/NLB)
-
-### 14.5 Key Takeaways
-
-1. The auth_service is the **front door** to the entire Sarvm backend. Every client request passes through it.
-2. It combines two concerns (auth + proxy) in a single service, which simplifies deployment but creates a single point of failure.
-3. JWT payloads are **rich and app-specific**, containing business data (shop info, onboarding flags, admin roles) embedded at token generation time.
-4. The service relies heavily on **cross-service HTTP calls** during token generation, creating tight coupling with RMS and LMS.
-5. There are significant **security concerns** (long-lived tokens, simple shared secret, no revocation) that should be addressed before scaling to production.
-
----
-
-*Document generated: April 2026*  
-*Service version: 1.0.0 | Build: 101*  
-*Author: Auto-generated from codebase analysis*
+The application communicates with **12 backend microservices** through a single API gateway, uses a layered service architecture for clean separation of concerns, and persists minimal client-side state in `localStorage`. Key areas for improvement include adding lazy-loading, comprehensive error handling, route guard coverage, and upgrading the Angular version.
