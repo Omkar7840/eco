@@ -1,216 +1,202 @@
-# Wallet Service - Deep Technical Architecture & Workflows
+# Catalogue Management Service - Architecture & Workflows
 
-**Project**: Wallet Service (Underlying Package Structure: `com.sarvmai.referralreward`)
+**Project**: Catalogue Management Service
 **Organization**: SARVM AI
-**Stack**: Spring Boot, Java 11, PostgreSQL, Cashfree SDK, Spring Data JPA
+**Stack**: Node.js, Express.js, PostgreSQL (Relational Master), MongoDB (Document Store), AWS S3
 
 ---
 
 ## 1. Executive Summary
 
-The **Wallet Service** operates as the central ledger out-bound settlement processor for the SARVM ecosystem. While external proxy microservices ingest funds natively via tools like Razorpay, the Wallet Service is strictly accountable for ledger validation, constraints mapping, and multi-tenant liquidity dispatching out of SARVM back into Retailer bank accounts.
+The **Catalogue Management Service** acts as the central Product Information Management (PIM) system for the SARVM ecosystem. Unlike transaction-focused microservices written in Java/Spring Boot (Payment/Wallet), the Catalogue service is highly read-optimized, written in Express.js.
 
-Leveraging the **Cashfree Payouts API**, it calculates withdrawal algorithms against immutable balances, creates fractional splits natively linking settled payments, simulates mass batch transfers optimized for B2B payouts, handles bank webhooks, and rolls back virtual bounds upon transactional failures securely. 
+It fundamentally creates and manages a global **Master Catalogue** tree (Catalog -> Category -> MicroCategory -> Products). It also supports massive Data Ingestion workflows (Bulk Updates) and effectively functions as a static site generator by "publishing" complex JSON payload structures directly to AWS S3, thereby offloading global read operations from the database to highly scalable CDNs.
 
-## 2. Deep Component Architecture
+## 2. System Architecture
 
-The Wallet service introduces robust data security primitives focusing heavily on race-condition evasion specifically at the database level.
+The service runs a unique Polyglot Persistence architecture, utilizing both SQL for strict relations and NoSQL/S3 for flexible complex hierarchies.
 
 ### Architecture Diagram
 
 ```mermaid
 graph TD
-    Client["Retailer App"] -->|"HTTPS"| API["API Gateway"]
-    Admin["Admin Panel / Superuser"] -->|"HTTPS"| API
+    Client["Admin / System User"] -->|"HTTPS"| API["Express Server (API)"]
     
-    API -->|"/withdrawal/request"| C1["WithdrawalController"]
-    API -->|"/admin/payouts/batch-transfer"| C2["CashfreePayoutController"]
-    API -->|"/api/cashfree/webhook/payout"| C3["CashfreeWebhookController"]
-    API -->|"/balance/"| C4["WalletBalanceController"]
+    API -->|"CRUD Operations"| C1["ProductController / CategoryController"]
+    API -->|"Mass Ingestion"| C2["BulkUpdateCatalogController"]
+    API -->|"CDN Generation"| C3["PublishController"]
     
-    C1 --> S1["WithdrawalService"]
+    C1 --> S1["Core Services (Product/Category)"]
     C2 --> S1
-    C3 --> S1
-    C4 --> S2["WalletBalanceService"]
     
-    S1 -->|"Batch Request (REST)"| CF["Cashfree Payout Network"]
+    C3 --> S2["PublishService"]
+    S2 -->|"Export JSON Blob"| S3["AWS S3 (CDN Output)"]
     
-    S1 -.->|"Row Lock For Update"| DB[("PostgreSQL")]
-    S2 -.->|"Read Immutable Value"| DB
-    
-    Cron["SettlementCronJob"] -->|"Daily Reconciles"| S1
+    S1 -->|"Strict Relations"| DB_SQL[("PostgreSQL")]
+    S1 -->|"Flexible Docs"| DB_MONGO[("MongoDB (mongoCatalog)")]
 ```
 
-- **Routing Layer**: Exposes granular hooks (`/api/withdrawal/request`), payout executions (`/admin/payouts/batch-transfer`), and pure ledger readouts (`/balance/`).
-- **Integration Layer**: Routes outgoing batch-transfers strictly to **Cashfree** (Specializing in IMPS/NEFT routing algorithms).
-- **Service Layer (`WithdrawalService`)**: Executes complex FIFO transactional logic linking specific `SarvmPaymentReconciliation` records to the specific Withdrawal and validating bounds.
+- **Routing Layer**: Express routers map `/v1/catalog`, `/v1/product`, `/v1/publish` directly to specialized controllers.
+- **Service Layer**: Decoupled models holding raw business logic for fetching IDs, resolving parent-child mappings, and cleaning strings.
+- **Dual Persistence Strategy**: Primary product associations live in PostgreSQL. However, flexible large-scale arrays and synced views live in MongoDB (`mongoModels` / `mongoCatalogService`). 
+- **CDN Publishing (`publish.js`)**: Converts massive multi-joined data trees into raw JSON, pushes it directly to an S3 Presigned URL, allowing client apps to fetch complex nested data inherently instantly via AWS Object Storage rather than querying databases for millions of API calls.
 
-## 3. High-Fidelity Data Flow Workflows
+## 3. Data Flow Workflows
 
-### Workflow 1: Retailer Withdrawal Initiation & Transaction Splitting (PENDING)
+### Workflow 1: Dynamic Catalogue Tree Construction (Static CDN Compilation)
 
-This workflow maps the precise constraints executed instantly when a retailer says "Withdraw ₹X from my wallet". It doesn't just debit a number; it explicitly links the exact settled transactions mapping that balance to the outbound request.
-
-```mermaid
-sequenceDiagram
-    participant R as Retailer App
-    participant W as WithdrawalController
-    participant S as WithdrawalService
-    participant DB as PostgreSQL 
-
-    R->>W: POST /withdrawal/request (Amount ₹500)
-    W->>S: createWithdrawalRequest()
-    
-    %% Constraints
-    Note over S: Constraint Check: >= Config Min Threshold?
-    S->>DB: Query Active Requests
-    Note over S,DB: Block if 1+ request is PENDING/PROCESSING
-    
-    %% Locks
-    S->>DB: findByUserIdForUpdate() [ROW LEVEL PESSIMISTIC LOCK]
-    DB-->>S: WalletBalance
-    
-    %% Constraint 
-    Note over S: Fail if WalletBalance < Amount
-    
-    %% Logic
-    S->>S: Create SarvmWithdrawalRequest (Status: PENDING)
-    S->>DB: Fetch Settled Unwithdrawn payments (Reconciliations)
-    
-    %% Loop
-    loop FIFO Allocation Array
-        Note over S: Does the reconciled transaction equal the remaining withdrawal amount?
-        alt Exact/Below Amount Fits
-            S->>DB: UPDATE Reconciliation SET withdrawal_id = ID
-        else Amount Exceeds the rest of withdrawal
-            S->>DB: Split Record. Update Origin to Remaining.
-            S->>DB: Create NEW Reconcil record (Leftover Funds, _SPLIT_ ID)
-        end
-    end
-    
-    S->>DB: DEBIT withdrawable_balance & available_balance (COMMIT)
-    S-->>R: Return Success (Request ID)
-```
-
-**Key Technical Detail**: The fractional chunking mechanism (`_SPLIT_ {ID}`) enforces exact 1-to-1 traceability from a Cashfree payload back to an originally ingested user purchase.
-
-### Workflow 2: Administrative Batch Processing (PROCESSING)
-
-SARVM admins compile pending transactions into Cashfree Batch Payloads to avoid massive API rate limits on sequential requests.
+This workflow outlines how the system recursively maps products and outputs them to an external high-speed JSON host via S3 (`publish.js`).
 
 ```mermaid
 sequenceDiagram
     participant Admin as Sarvm Admin
-    participant PC as CashfreePayoutController
-    participant S as WithdrawalService
-    participant CF as Cashfree APIS
-    participant DB as PostgreSQL
+    participant P as PublishController
+    participant S as PublishService
+    participant DB as Postgres/Mongo
+    participant AWS as AWS S3
 
-    Admin->>PC: POST /batch-transfer (IDs: [4,5,6])
-    PC->>S: processBatchTransfer()
+    Admin->>P: POST /v1/publish (version=X)
+    P->>DB: Fetch All Active Catalogs
     
-    loop Per Request
-        S->>DB: Filter ONLY string='PENDING'
-        S->>DB: Identify Active Bank Account / VPA target
-        S->>S: Threshold Scan
-        Note over S: If Account=UPI & Amount > ₹1,00,000 -> Fallback IMPS Mode
-        S->>S: Append to CashfreeTransfer List
+    loop For Every Catalog
+        P->>DB: Fetch Categories
+        loop For Every Category
+            P->>DB: Fetch SubCategories
+            loop For Every SubCategory
+                P->>DB: Fetch ProductCategoryMap
+                P->>DB: Resolve Product List
+            end
+            P->>P: Extract MicroCategories & Append `all` Filter
+        end
     end
     
-    S->>CF: POST bulk request
-    CF-->>S: Return CashfreeBatchResponse (Contains Acks/Fails)
-    
-    S->>DB: Persist highly detailed SarvmBatchTransferLog
-    S->>DB: Update specific Request status='PROCESSING'
-    S-->>Admin: 200 OK
+    P->>P: Compile Giant Categorical JSON Object
+    P->>P: Request Presigned URL (getJsonUrl)
+    P->>AWS: uploadJSONtoS3(key, responseBlob)
+    AWS-->>P: Return Public Object URL
+    P-->>Admin: 200 OK (URL: https://s3.aws.com/...)
 ```
 
-### Workflow 3: Settled Payload Interception (SUCCESS | ROLLBACK)
+### Workflow 2: Catalog Bulk Ingestion
 
-Cashfree utilizes Webhooks to independently confirm successful NEFT/UPI bank reception asynchronously (from milliseconds to T+1 hours). 
+Flow for parsing massive CSV/Excel sheets into normalized database environments.
 
 ```mermaid
 sequenceDiagram
-    participant CF as Cashfree Webhook
-    participant W as CashfreeWebhookController
-    participant S as WithdrawalService
-    participant DB as PostgreSQL
+    participant User as Admin Client
+    participant C as BulkUpdateController
+    participant S as SyncService
+    participant SQL as PostgreSQL
+    participant MONGO as MongoDB
 
-    CF->>W: POST /webhook/payout (transfer.success / transfer.failed)
-    W->>S: updateWithdrawalStatus()
-    S->>DB: FETCH withdrawal by CashfreeTransferId
+    User->>C: POST /bulkUpdate (File Buffer)
+    C->>C: Validate File Types
+    C->>S: parse()
+    C->>S: sanitizeString(dummyKey)
     
-    alt Status == SUCCESS
-        S->>DB: UPDATE state='SUCCESS'
-        S->>DB: Append cashfree UTR (Bank Reference ID)
-    else Status == FAILED
-        S->>DB: UPDATE state='FAILED'
-        S->>DB: INITIATE ROLLBACK ALGORITHM
-        S->>DB: findByUserIdForUpdate()
-        S->>DB: CREDIT available_balance + requestedAmount
-        S->>DB: unlinkWithdrawalFromReconciliationByWithdrawalId() (Free orders)
+    loop For Each Node Item
+        alt Product Exists
+            S->>SQL: UPDATE Product Attributes
+        else New Product
+            S->>SQL: INSERT Product
+        end
+        S->>MONGO: synchronizeProduct(modifiedData)
     end
     
-    W-->>CF: 200 OK
+    C-->>User: 200 OK (Stats / Errors Array)
 ```
 
-## 4. Tech Stack Intricacies
+## 4. Tech Stack
 
-- **Datastore Locking Mechanism**: Utilizes standard `@Transactional` wrappers paired locally with native `FOR UPDATE` PostgreSQL pessimistic row locks (`findByUserIdForUpdate`) ensuring absolute mathematical consensus.
-- **External Integration Client**: Custom object mapping over `CashfreeWebhookRequest` & `CashfreeBatchResponse`.
-- **Date Mechanics**: Converts natively across `OffsetDateTime` tracking precisely when bank acks drop vs when admins initialize processing.
+- **Platform**: Node.js
+- **Framework**: Express.js
+- **Persistence 1**: PostgreSQL (Sequelize/Raw SQL)
+- **Persistence 2**: MongoDB (Mongoose Schema mapping)
+- **External Dependencies**: Axios, ShortUniqueID, Mongoose, AWS-SDK
+- **Formatting/Linting**: ESLint, Prettier
 
-## 5. Architectural Project Flow
+## 5. Project Structure
 
 ```text
-src/main/java/com/sarvmai/referralreward/
-├── controller/        
-│   ├── WithdrawalController.java        # Core Retailer Facing
-│   ├── CashfreePayoutController.java    # Internal Operator Facing
-│   └── CashfreeWebhookController.java   # M2M Banking Facing
-├── service/           
-│   └── WithdrawalService.java           # Central Logic Core (600+ LOCs)
-├── entity/            
-│   ├── SarvmWithdrawalRequest           # State machine entity
-│   ├── SarvmBatchTransferLog            # Audit payload log
-│   └── SarvmPaymentReconciliation       # Source-of-truth linkable payment mappings
-├── repositories/      
-│   ├── SarvmOnlinePaymentBalanceRepository # Employs standard row-locking mechanisms 
-│   └── SarvmWithdrawalRequestRepository    
-├── config/             # Injectible limits (MinThresholds) 
-└── exception/          # Deeply bounded context threshold responses 
+catalogue_mgmt_service/
+├── .env / .dev.env / .prd.env     # Environment segregations
+├── package.json                   # Node modules map
+├── server.js                      # Application instantiation
+└── src/
+    ├── InitApp/                   # Express App & Middlewares config
+    ├── apis/
+    │   ├── controllers/v1         # Express Request Handlers
+    │   ├── services/v1            # Domain Logic (Category, UploadDoc, publish)
+    │   ├── db/                    # SQL Mappings & Migrations
+    │   ├── db_meta/               # Metadata DB instances
+    │   ├── mongoModels/           # Mongoose schemas
+    │   └── routes/                # Express Route Endpoints
+    ├── common/                    # Generic utilities (S3 uploaders, Loggers)
+    └── scripts/                   # Migration or DB Seed Scripts
 ```
 
-## 6. Granular Core Functionality
+## 6. Core Functionality
 
-- **Database Pessimistic Locking**: Prevents all double-spend race conditions globally during `/api/withdrawal/request` via forcing PostgreSQL row locks on the retailer's balance entity.
-- **Micro-transaction Splitting (FIFO Allocations)**: If a `Withdrawal Amount` consumes 2.5 historically settled purchases, the application surgically splits the 3rd `SarvmPaymentReconciliation` record marking half linked to the withdrawal and spawning an unlinked `leftover` instance.
-- **Dynamic Bank Threshold Limiters**: Programmatically switches `PayoutMode` back down to foundational `IMPS` bounds if a user attempts to map a `UPI VPA` request over India's standard ₹1,00,000 threshold dynamically.
-- **Batch Transfer Traceability**: Creates exhaustive `SarvmBatchTransferLog` entries detailing `totalTransfers`, `acknowledged`, `failedCount`, and `rawResponse` strings against the exact Cashfree bulk ID.
-- **Atomic Rollbacks**: Complete reversal of balances and unlinking of exact split-associated historical payments upon Bank `transfer.failure`.
+- **Hierarchical Classification**: Models deep parent-child links: `Catalog` -> `Category` -> `SubCategory` (MicroCategory)-> `Product`.
+- **Hybrid Data Generation**: Instead of traditional API polling, caching relies entirely on massive periodic S3 Data pushes, dramatically accelerating startup rendering on the consumer-facing apps.
+- **Short UUIDs**: Leverages `shortUniqueId` (`createUniqueKey.js`) natively providing robust URL-friendly short IDs for catalogues avoiding long clunky UUIDs or predictable Sequence integers.
+- **Polyglot Synchronization**: Updates to `Catalog.js` automatically sync across into the MongoDB pipeline (`mongoCatalogService.addBulkCatalog(modifiedData)`).
 
-## 7. Granular API Definitions
+## 7. APIs & Integrations
 
-**Exposed Endpoints**:
-- `POST /api/withdrawal/request` -> Accepts `{"amount", "externalBeneficiaryId"}`. Performs the heavy FIFO isolation split and credits/debits the PGSQL Lock.
-- `GET /api/withdrawal/history/{retailerId}/getWithdrawlRequestsHistory` -> Fetches all prior.
-- `GET /api/withdrawal/{withdrawalId}/breakdown` -> Provides granular, per-order line-item breakdown linking exact historic consumer orders that culminated into the withdrawal grouping payload.
-- `POST /admin/payouts/batch-transfer` -> Takes `List<withdrawalIds>`, processes the dynamic IMPS evaluation over the grouping, and fires it directly into the `api.cashfree.com/payout/transfers` proxy.
-- `POST /api/cashfree/webhook/payout` -> Mutates internal status safely.
+**Controllers & Routes Available**:
+- **`/v1/catalog`**: Standard CRUD (Add, List, SoftDelete).
+- **`/v1/bulkUpdateCatalog`**: Bulk updates by parsing files / JSON payloads natively mapping columns to system constraints.
+- **`/v1/publish`**: Static compiler triggering the map-reduce iteration outputting an AWS S3 URL.
+- **`/v1/retailerCatalog`**: Endpoints isolated for scoping catalogues to isolated shops ensuring a generic system catalog can be derived per tenant.
 
-## 8. State Transitions (Enums & Machine)
+**External Network**:
+- `AWS S3`: Presigned URL fetching and mass JSON blob dropping.
 
-`SarvmWithdrawalRequest.Status` Lifecycle Context:
-1. **PENDING**: Balance is held internally. Not dispatched to external banks. Fully actionable.
-2. **PROCESSING**: Dispatched to Cashfree via Batch. Awaiting Bank ACK. Irreversible via internal mechanics alone.
-3. **SUCCESS**: Cleared the clearing-house mapping. Possesses definitive Network UTR keys.
-4. **FAILED**: Failed downstream. The `WithdrawalService.rollbackWithdrawal` pipeline is forcibly executed to refund the balance back into `PENDING` states on the internal network allowing retailer retries.
+## 8. Database Design
 
-## 9. Performance & Bottleneck Mitigations
+1. SQL Tables:
+   - **Catalogs**: Identifiers, tax statuses, visual elements.
+   - **Categories**: Parent-Child relationships natively.
+   - **Products**: SKUs, descriptions, pricing mappings.
+   - **ProductCategoryMappings**: Many-To-Many bridging.
+2. NoSQL Mongo Documents:
+   - **MongoCatalog**: Flat, deeply indexed document records optimizing arbitrary filtering outside traditional SQL joins. 
 
-- **Scalability Through Isolation**: Due to the severe pessimistic locking on active Retailer `balanceRepository.findByUserIdForUpdate`, two concurrent withdrawal taps logically wait out internal PGSQL sequencing ensuring impossible negative bounds. This heavily protects database state integrity at the cost of slight queuing on immense simultaneous loads.
-- **Network Reduction**: By grouping payouts into lists inside the `CashfreePayoutController`, the internal Java environment skips spinning up 50 network `HttpUrlConnections` prioritizing 1 bulk stream.
+## 9. Setup & Installation
 
-## 10. Summary Extrapolations
+Ensure you have Node.js and PostgreSQL/MongoDB setups globally.
+1. Map environment variables (or copy `.env.example` -> `.env`).
+2. Deploy the application locally:
+   ```bash
+   npm install
+   npm run start:dev
+   ```
 
-The **Wallet Service** sets the high-watermark for structural integrity. The application treats its internal virtual values as inherently tethered to exact external realities, utilizing surgical logic constructs (`_SPLIT_` allocation cloning), robust Database Mutex boundaries (Pessimistic Write configurations), and granular Bulk Audit logs effectively allowing it to serve as a hardened Ledger environment.
+## 10. User Flow
+
+1. Admin acquires a standardized Excel sheet of 500 new FMCG Products.
+2. Admin utilizes the `/v1/bulkUpdateCatalog` endpoint. The Node server sanitizes arrays, auto-generates internal ShortUniqueIDs, and persists dual bindings in Postgres/Mongo.
+3. System hits the `/v1/publish` hook automatically or manually.
+4. The service maps 6 levels deep, compiling all 500 products into an S3 `.json` repository. 
+5. The Retailer App fetches the `.json` directly from the AWS CloudFront/S3 edge node natively caching all catalogues without burning SARVM DB resources.
+
+## 11. Edge Cases & Limitations
+
+- **Publish Operation Blocking**: The `publish.js` map algorithm does not currently utilize Worker Threads (`child_process`). Its massive nested map loops (`for let catalog of catalogs... await...`) can severely block the generic Node.js Event Loop halting other `/catalog` traffic during compilation.
+- **Split Brain Storage**: Data mutation across PostgreSQL and MongoDB simultaneously carries massive risks of "Split Brain" inconsistency if a service crashes mid-flight without strict dual-commit logic (Saga Pattern or 2PC).
+
+## 12. Performance & Scalability
+
+- **S3 Render Extrapolation**: Publishing highly nested data into static endpoints reduces active Server throughput demands globally by 99% for active users fetching catalogs. 
+- **Weakness**: Node.js V8 execution blocks if an array inside `publish.js` scales to 1,000,000 products natively. 
+
+## 13. Future Improvements
+
+1. **Async Queue Workers**: Offloading `publish.js` and `bulkUpdateCatalog.js` to a queue network (like BullMQ + Redis) removing long-running HTTP blocks off the primary thread.
+2. **GraphQL Transition**: Implementing GraphQL strictly to replace deeply nested hardcoded Map/Reduce sequences in the publish controllers allowing customized data fetches inherently.
+3. **Optimistic Pre-computation**: Emitting AMQP/Kafka events upon distinct Product saves rather than mass-recompiling the entire tree.
+
+## 14. Summary
+
+The Catalogue Management Service operates fundamentally differently from the internal Java ledgers. As a Node System, it focuses on hyper-fast manipulation of hierarchical arrays, and uniquely offloads high-read network pressure by physically publishing the catalog to S3 buckets, operating as a functional Static API Compiler.
