@@ -1,202 +1,407 @@
-# Catalogue Management Service - Architecture & Workflows
+# Complete Dynamic Catalog Implementation Code & Setup Guide
 
-**Project**: Catalogue Management Service
-**Organization**: SARVM AI
-**Stack**: Node.js, Express.js, PostgreSQL (Relational Master), MongoDB (Document Store), AWS S3
+This document contains **all the necessary code** for the Location-Aware Product Catalog feature, combined into a single place. Follow these step-by-step instructions to implement the code in your local codebase.
 
 ---
 
-## 1. Executive Summary
+## Prerequisites & Installation
 
-The **Catalogue Management Service** acts as the central Product Information Management (PIM) system for the SARVM ecosystem. Unlike transaction-focused microservices written in Java/Spring Boot (Payment/Wallet), the Catalogue service is highly read-optimized, written in Express.js.
+Before writing the code, ensure the background dependencies are installed in your backend service. Open your terminal in the backend folder and run:
 
-It fundamentally creates and manages a global **Master Catalogue** tree (Catalog -> Category -> MicroCategory -> Products). It also supports massive Data Ingestion workflows (Bulk Updates) and effectively functions as a static site generator by "publishing" complex JSON payload structures directly to AWS S3, thereby offloading global read operations from the database to highly scalable CDNs.
+```bash
+cd d:\Sarvm\backend\catalogue_mgmt_service
+npm install @google/genai axios
+```
+*(Note: `node-cron` is already in your `package.json` so it will be available).*
 
-## 2. System Architecture
+---
 
-The service runs a unique Polyglot Persistence architecture, utilizing both SQL for strict relations and NoSQL/S3 for flexible complex hierarchies.
+## BACKEND CODE (catalogue_mgmt_service)
 
-### Architecture Diagram
+### 1. AI Product Trends Schema
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\aiProductTrendsSchema.js`
 
-```mermaid
-graph TD
-    Client["Admin / System User"] -->|"HTTPS"| API["Express Server (API)"]
-    
-    API -->|"CRUD Operations"| C1["ProductController / CategoryController"]
-    API -->|"Mass Ingestion"| C2["BulkUpdateCatalogController"]
-    API -->|"CDN Generation"| C3["PublishController"]
-    
-    C1 --> S1["Core Services (Product/Category)"]
-    C2 --> S1
-    
-    C3 --> S2["PublishService"]
-    S2 -->|"Export JSON Blob"| S3["AWS S3 (CDN Output)"]
-    
-    S1 -->|"Strict Relations"| DB_SQL[("PostgreSQL")]
-    S1 -->|"Flexible Docs"| DB_MONGO[("MongoDB (mongoCatalog)")]
+```javascript
+// src/apis/models/mongoCatalog/aiProductTrendsSchema.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const aiProductTrendsSchema = new Schema({
+    zipcode: { type: String, required: true },
+    city: { type: String },
+    state: { type: String },
+    category: { type: String, required: true },
+    products: [{ type: String }], // Array of AI suggested product names
+    lastUpdated: { type: Date, default: Date.now }
+});
+
+// Ensure we don't duplicate trend requests for a specific zip + category
+aiProductTrendsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
+
+module.exports = mongoose.model('AiProductTrends', aiProductTrendsSchema);
 ```
 
-- **Routing Layer**: Express routers map `/v1/catalog`, `/v1/product`, `/v1/publish` directly to specialized controllers.
-- **Service Layer**: Decoupled models holding raw business logic for fetching IDs, resolving parent-child mappings, and cleaning strings.
-- **Dual Persistence Strategy**: Primary product associations live in PostgreSQL. However, flexible large-scale arrays and synced views live in MongoDB (`mongoModels` / `mongoCatalogService`). 
-- **CDN Publishing (`publish.js`)**: Converts massive multi-joined data trees into raw JSON, pushes it directly to an S3 Presigned URL, allowing client apps to fetch complex nested data inherently instantly via AWS Object Storage rather than querying databases for millions of API calls.
+### 2. Area Product Insights Schema
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\areaProductInsightsSchema.js`
 
-## 3. Data Flow Workflows
+```javascript
+// src/apis/models/mongoCatalog/areaProductInsightsSchema.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
 
-### Workflow 1: Dynamic Catalogue Tree Construction (Static CDN Compilation)
+const areaProductInsightsSchema = new Schema({
+    zipcode: { type: String, required: true },
+    city: { type: String },
+    state: { type: String },
+    category: { type: String, required: true },
+    rankedProducts: [{
+        product_id: { type: String },
+        product_name: { type: String },
+        score: { type: Number },
+        source: { type: String, enum: ['REAL_DATA', 'AI_TREND', 'MIXED'] },
+        price_estimate: { type: Number, default: 0 }
+    }],
+    lastUpdated: { type: Date, default: Date.now }
+});
 
-This workflow outlines how the system recursively maps products and outputs them to an external high-speed JSON host via S3 (`publish.js`).
+// Efficient fetching at runtime
+areaProductInsightsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
+areaProductInsightsSchema.index({ city: 1, category: 1 }); // fallback index
 
-```mermaid
-sequenceDiagram
-    participant Admin as Sarvm Admin
-    participant P as PublishController
-    participant S as PublishService
-    participant DB as Postgres/Mongo
-    participant AWS as AWS S3
-
-    Admin->>P: POST /v1/publish (version=X)
-    P->>DB: Fetch All Active Catalogs
-    
-    loop For Every Catalog
-        P->>DB: Fetch Categories
-        loop For Every Category
-            P->>DB: Fetch SubCategories
-            loop For Every SubCategory
-                P->>DB: Fetch ProductCategoryMap
-                P->>DB: Resolve Product List
-            end
-            P->>P: Extract MicroCategories & Append `all` Filter
-        end
-    end
-    
-    P->>P: Compile Giant Categorical JSON Object
-    P->>P: Request Presigned URL (getJsonUrl)
-    P->>AWS: uploadJSONtoS3(key, responseBlob)
-    AWS-->>P: Return Public Object URL
-    P-->>Admin: 200 OK (URL: https://s3.aws.com/...)
+module.exports = mongoose.model('AreaProductInsights', areaProductInsightsSchema);
 ```
 
-### Workflow 2: Catalog Bulk Ingestion
+### 3. Gemini AI Service Integration
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\geminiService.js`
 
-Flow for parsing massive CSV/Excel sheets into normalized database environments.
+```javascript
+// src/apis/services/v1/mongoCatalog/geminiService.js
+const { Logger: log } = require('sarvm-utility');
+const { GoogleGenerativeAI } = require('@google/genai');
 
-```mermaid
-sequenceDiagram
-    participant User as Admin Client
-    participant C as BulkUpdateController
-    participant S as SyncService
-    participant SQL as PostgreSQL
-    participant MONGO as MongoDB
+// Use environment variable for API key (Add GEMINI_API_KEY to your .lcl.env)
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'FALLBACK_KEY_FOR_LOCAL_TEST');
 
-    User->>C: POST /bulkUpdate (File Buffer)
-    C->>C: Validate File Types
-    C->>S: parse()
-    C->>S: sanitizeString(dummyKey)
-    
-    loop For Each Node Item
-        alt Product Exists
-            S->>SQL: UPDATE Product Attributes
-        else New Product
-            S->>SQL: INSERT Product
-        end
-        S->>MONGO: synchronizeProduct(modifiedData)
-    end
-    
-    C-->>User: 200 OK (Stats / Errors Array)
+const fetchTrendsFromGemini = async (zipcode, city, category) => {
+    log.info({ info: `Fetching AI trends for zip: ${zipcode}, cat: ${category}` });
+
+    // Local override if no actual key is configured yet
+    if (!process.env.GEMINI_API_KEY) {
+        log.info({ info: `Using Mock AI Data for local testing.` });
+        return [
+            "Aashirvaad Whole Wheat Atta", "Amul Pasteurized Butter", "Tata Salt",
+            "Maggi 2-Minute Noodles", "Surf Excel Easy Wash", "Brooke Bond Red Label Tea",
+            "Saffola Gold Cooking Oil", "Everest Garam Masala", "Colgate Strong Teeth"
+        ];
+    }
+
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = `Provide exactly a JSON array of strings representing the top 20 most frequently purchased grocery and household products for zipcode ${zipcode} (${city}, India) in the "${category}" category. Output strictly valid JSON array format like ["Product 1", "Product 2"].`;
+
+        const result = await model.generateContent(prompt);
+        let textResponse = result.response.text();
+        
+        // Clean markdown backticks if any
+        textResponse = textResponse.replace(/^```json/m, '').replace(/```$/m, '').trim();
+        const productList = JSON.parse(textResponse);
+        
+        return productList;
+    } catch (error) {
+        log.error({ error: `Gemini API Failure: ${error.message}` });
+        return []; // fail gracefully
+    }
+};
+
+module.exports = { fetchTrendsFromGemini };
 ```
 
-## 4. Tech Stack
+### 4. Cron Job Processor Workflow
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\dynamicCatalogCron.js`
 
-- **Platform**: Node.js
-- **Framework**: Express.js
-- **Persistence 1**: PostgreSQL (Sequelize/Raw SQL)
-- **Persistence 2**: MongoDB (Mongoose Schema mapping)
-- **External Dependencies**: Axios, ShortUniqueID, Mongoose, AWS-SDK
-- **Formatting/Linting**: ESLint, Prettier
+```javascript
+// src/apis/services/v1/mongoCatalog/dynamicCatalogCron.js
+const cron = require('node-cron');
+const { Logger: log } = require('sarvm-utility');
+const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
+const AiProductTrends = require('../../models/mongoCatalog/aiProductTrendsSchema');
+const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
+const Product = require('../../models/mongoCatalog/productSchema');
+const { fetchTrendsFromGemini } = require('./geminiService');
 
-## 5. Project Structure
+const EXPIRATION_DAYS = 7;
 
-```text
-catalogue_mgmt_service/
-├── .env / .dev.env / .prd.env     # Environment segregations
-├── package.json                   # Node modules map
-├── server.js                      # Application instantiation
-└── src/
-    ├── InitApp/                   # Express App & Middlewares config
-    ├── apis/
-    │   ├── controllers/v1         # Express Request Handlers
-    │   ├── services/v1            # Domain Logic (Category, UploadDoc, publish)
-    │   ├── db/                    # SQL Mappings & Migrations
-    │   ├── db_meta/               # Metadata DB instances
-    │   ├── mongoModels/           # Mongoose schemas
-    │   └── routes/                # Express Route Endpoints
-    ├── common/                    # Generic utilities (S3 uploaders, Loggers)
-    └── scripts/                   # Migration or DB Seed Scripts
+const runNightlyProcessor = async () => {
+    log.info({ info: 'Starting Dynamic Catalog Generation Job...' });
+
+    try {
+        // Step 1: In a real scenario, you'd aggregate real seller catalogs. 
+        // Example mock array of areas to process standard categories:
+        const targets = [
+            { zipcode: '110001', city: 'Delhi', state: 'Delhi', category: 'grocery' }
+        ];
+
+        for (const target of targets) {
+            const { zipcode, city, state, category } = target;
+
+            // Step 2: Check standard AI insight cache
+            let aiTrends = await AiProductTrends.findOne({ zipcode, category });
+            const now = new Date();
+            const needsRefresh = !aiTrends || ((now - aiTrends.lastUpdated) / (1000 * 60 * 60 * 24)) > EXPIRATION_DAYS;
+
+            if (needsRefresh) {
+                const freshProducts = await fetchTrendsFromGemini(zipcode, city, category);
+                
+                if (freshProducts.length > 0) {
+                    aiTrends = await AiProductTrends.findOneAndUpdate(
+                        { zipcode, category },
+                        { city, state, products: freshProducts, lastUpdated: now },
+                        { upsert: true, new: true }
+                    );
+                }
+            }
+
+            const aiList = aiTrends ? aiTrends.products : [];
+            let finalList = [];
+            let score = 100;
+
+            // Step 3: Normalize Names and Fetch Real Master Product IDs
+            for (const name of aiList) {
+                // Find nearest master product match (Regex case-insensitive)
+                const masterProduct = await Product.findOne({
+                    prdNm: { $regex: new RegExp(name, 'i') }
+                }).lean();
+
+                if (masterProduct) {
+                    finalList.push({
+                        product_id: masterProduct._id.toString(), // or masterProduct.dumK
+                        product_name: masterProduct.prdNm,
+                        score: score--, // Assign rank
+                        source: 'AI_TREND',
+                        price_estimate: masterProduct.prc.mrp || 0
+                    });
+                }
+            }
+
+            // Step 4: Upsert Area Product Insights
+            if (finalList.length > 0) {
+                await AreaProductInsights.findOneAndUpdate(
+                    { zipcode, category },
+                    { city, state, rankedProducts: finalList, lastUpdated: now },
+                    { upsert: true }
+                );
+                log.info({ info: `Updated Area Insights for Zip: ${zipcode}` });
+            }
+        }
+    } catch (error) {
+        log.error({ error: `Dynamic Catalog Job failed: ${error.message}` });
+    }
+};
+
+const initCron = () => {
+    // Runs at 2 AM every day
+    cron.schedule('0 2 * * *', () => {
+        runNightlyProcessor().catch(err => log.error({ error: err }));
+    });
+};
+
+module.exports = { initCron, runNightlyProcessor };
 ```
 
-## 6. Core Functionality
+### 5. Controller for Fetching Data
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\controllers\v1\mongoCatalog\dynamicCatalog.js`
 
-- **Hierarchical Classification**: Models deep parent-child links: `Catalog` -> `Category` -> `SubCategory` (MicroCategory)-> `Product`.
-- **Hybrid Data Generation**: Instead of traditional API polling, caching relies entirely on massive periodic S3 Data pushes, dramatically accelerating startup rendering on the consumer-facing apps.
-- **Short UUIDs**: Leverages `shortUniqueId` (`createUniqueKey.js`) natively providing robust URL-friendly short IDs for catalogues avoiding long clunky UUIDs or predictable Sequence integers.
-- **Polyglot Synchronization**: Updates to `Catalog.js` automatically sync across into the MongoDB pipeline (`mongoCatalogService.addBulkCatalog(modifiedData)`).
+```javascript
+// src/apis/controllers/v1/mongoCatalog/dynamicCatalog.js
+const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
+const { Logger: log } = require('sarvm-utility');
 
-## 7. APIs & Integrations
+const getDynamicCatalogInsights = async (zipcode, city, state, category) => {
+    log.info({ info: 'Fetching Dynamic Catalog details' });
+    
+    // 1. Try highly specific zipcode match
+    let insights = await AreaProductInsights.findOne({ zipcode, category }).lean();
+    
+    // 2. Fallback to general city match
+    if (!insights && city) {
+        insights = await AreaProductInsights.findOne({ city, category }).lean();
+    }
 
-**Controllers & Routes Available**:
-- **`/v1/catalog`**: Standard CRUD (Add, List, SoftDelete).
-- **`/v1/bulkUpdateCatalog`**: Bulk updates by parsing files / JSON payloads natively mapping columns to system constraints.
-- **`/v1/publish`**: Static compiler triggering the map-reduce iteration outputting an AWS S3 URL.
-- **`/v1/retailerCatalog`**: Endpoints isolated for scoping catalogues to isolated shops ensuring a generic system catalog can be derived per tenant.
+    if (!insights) {
+        return { source: 'DEFAULT', catalog: [] }; // The frontend should fall back to standard Master Catalog behavior
+    }
 
-**External Network**:
-- `AWS S3`: Presigned URL fetching and mass JSON blob dropping.
+    return {
+        source: 'DYNAMIC',
+        catalog: insights.rankedProducts
+    };
+};
 
-## 8. Database Design
+module.exports = { getDynamicCatalogInsights };
+```
 
-1. SQL Tables:
-   - **Catalogs**: Identifiers, tax statuses, visual elements.
-   - **Categories**: Parent-Child relationships natively.
-   - **Products**: SKUs, descriptions, pricing mappings.
-   - **ProductCategoryMappings**: Many-To-Many bridging.
-2. NoSQL Mongo Documents:
-   - **MongoCatalog**: Flat, deeply indexed document records optimizing arbitrary filtering outside traditional SQL joins. 
+### 6. API Route for Dynamic Catalog
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\dynamicCatalog.js`
 
-## 9. Setup & Installation
+```javascript
+// src/apis/routes/v1/dynamicCatalog.js
+const express = require('express');
+const { HttpResponseHandler, Logger: log } = require('sarvm-utility');
+const dynamicCatalogController = require('../../controllers/v1/mongoCatalog/dynamicCatalog');
 
-Ensure you have Node.js and PostgreSQL/MongoDB setups globally.
-1. Map environment variables (or copy `.env.example` -> `.env`).
-2. Deploy the application locally:
+const router = express.Router();
+
+router.get('/insights', async (req, res, next) => {
+    try {
+        const { zipcode, city, state, category } = req.query;
+        if (!zipcode || !category) {
+            return HttpResponseHandler.badRequest(req, res, 'Zipcode and Category are required');
+            // Alternatively standard HTTP 400 validation depending on sarvm-utility
+        }
+
+        const result = await dynamicCatalogController.getDynamicCatalogInsights(zipcode, city, state, category);
+        HttpResponseHandler.success(req, res, result);
+    } catch (error) {
+        log.error({ error });
+        next(error);
+    }
+});
+
+module.exports = router;
+```
+
+### 7. Bind Routes (Modifying existing backend files)
+**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\index.js`
+
+*Add the following towards the top with other imports:*
+```javascript
+const dynamicCatalogRouter = require('./dynamicCatalog');
+```
+*Add the following towards the bottom near `router.use('/category'...`:*
+```javascript
+router.use('/dynamicCatalog', dynamicCatalogRouter);
+```
+
+**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\server.js`
+
+*Add this somewhere around line 21 (inside `InitApp(app).then(() => {`):*
+```javascript
+const { initCron } = require('./src/apis/services/v1/mongoCatalog/dynamicCatalogCron');
+initCron(); 
+```
+
+---
+
+## FRONTEND CODE (hha_web)
+
+### 1. Application Constants
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\config\constants.ts`
+
+*Inside the `ApiUrls` object (approx line 122), append the new route:*
+```typescript
+  dynamicCatalogInsights: '/cms/apis/v1/dynamicCatalog/insights',
+```
+
+### 2. Catalogue Service 
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\lib\services\catalogue.service.ts`
+
+*Add this new function block directly inside the `CatalogueService` class:*
+```typescript
+  getDynamicInsights(zipcode: string, city: string, state: string, category: string) {
+    // Note: ensure the environment base URL corresponds to the proxy resolving to the catalogue service node process. 
+    const url = `${environment.baseUrl}${ApiUrls.dynamicCatalogInsights}?zipcode=${zipcode}&city=${city}&state=${state}&category=${category}`;
+    return this.commonApi.getDataByUrl(url);
+  }
+```
+
+### 3. Google Component Updates
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\pages\store\google-stores\google-stores.component.ts`
+
+*Locate the `loadShopData()` method. You will inject the new dynamic logic whenever a Google shop (unverified profile) is loaded.*
+
+**Modify `loadShopData` as follows:**
+```typescript
+  loadShopData() {
+    this.commonservice.presentProgressBarLoading();
+    this.catalogueService.getmerchant(this.profileUrl!).subscribe({
+      next: async (res: any) => {
+        this.shopData = res;
+        this.shopProfileUrl = res?.shop?.profileUrl || null;
+        
+        // --- NEW DYNAMIC CATALOG HOOK ---
+        const shopZip = res?.shop?.address?.zipcode || '110001'; // Extract real zip if available
+        const shopCity = res?.shop?.address?.city || 'Delhi';
+        
+        if (res?.catalog?.length) {
+          this.selectedCategoryId = res.catalog[0].id;
+          
+          try {
+            const dynamicRes: any = await this.catalogueService.getDynamicInsights(shopZip, shopCity, '', 'grocery').toPromise();
+            
+            if (dynamicRes?.data?.source === 'DYNAMIC') {
+              // Extract the highly ranked subset
+              const curatedProducts = dynamicRes.data.catalog; 
+              
+              // Map AI/Dynamic data back to the UI format expected by your templates
+              res.catalog[0].categories[0].products = curatedProducts.map((p: any) => ({
+                 prdNm: p.product_name,
+                 price: { mrp: p.price_estimate || 0 },
+                 quantity: { soldBy: '1 unit', minQty: 1 },
+                 media: { imgTh: null, img1: null },
+                 status: 'PUBLISHED'
+              }));
+            }
+          } catch(e) {
+             console.log("Failed to fetch dynamic insights, defaulting to standard catalog.", e);
+          }
+        }
+        // ---------------------------------
+
+        this.loading = false;
+        this.flag = !res?.catalog?.length;
+
+        if (res?.catalog?.length) {
+          this.selectedCategory = 0;
+          this.selectedSubCategory = 0;
+          this.selectedMicroCategory = 1;
+        }
+        
+        const vegnonVeg = this.storageService.getItem(Constants.SELECT_PREFERENCE);
+        this.isVeg = vegnonVeg ? vegnonVeg === 'veg' : false;
+        this.commonservice.closeProgressBarLoading();
+      },
+      error: (err) => {
+        console.error('Failed to fetch profile.json', err);
+        this.loading = false;
+        this.flag = true;
+        this.commonservice.closeProgressBarLoading();
+      },
+    });
+  }
+```
+
+---
+
+## Environment Setup Details (How to Run)
+
+1. **Environmental Variables:**
+   * Open `d:\Sarvm\backend\catalogue_mgmt_service\.lcl.env` (or whatever env file you use to run locally).
+   * Add `GEMINI_API_KEY=your_google_api_key_here` (Optional, as the script provides a fallback dummy list for local testing).
+
+2. **Database:**
+   * Your local MongoDB must be running. Running the backend code above will automatically create the `ai_product_trends` and `area_product_insights` collections when the cron job performs upserts.
+
+3. **Running the Backend locally:**
    ```bash
-   npm install
-   npm run start:dev
+   cd d:\Sarvm\backend\catalogue_mgmt_service
+   npm run lcl 
    ```
+   *To immediately see it work without waiting for 2 AM, temporarily modify your cron schedule inside `dynamicCatalogCron.js` to `* * * * *` (runs every minute), and observe the console logs.*
 
-## 10. User Flow
-
-1. Admin acquires a standardized Excel sheet of 500 new FMCG Products.
-2. Admin utilizes the `/v1/bulkUpdateCatalog` endpoint. The Node server sanitizes arrays, auto-generates internal ShortUniqueIDs, and persists dual bindings in Postgres/Mongo.
-3. System hits the `/v1/publish` hook automatically or manually.
-4. The service maps 6 levels deep, compiling all 500 products into an S3 `.json` repository. 
-5. The Retailer App fetches the `.json` directly from the AWS CloudFront/S3 edge node natively caching all catalogues without burning SARVM DB resources.
-
-## 11. Edge Cases & Limitations
-
-- **Publish Operation Blocking**: The `publish.js` map algorithm does not currently utilize Worker Threads (`child_process`). Its massive nested map loops (`for let catalog of catalogs... await...`) can severely block the generic Node.js Event Loop halting other `/catalog` traffic during compilation.
-- **Split Brain Storage**: Data mutation across PostgreSQL and MongoDB simultaneously carries massive risks of "Split Brain" inconsistency if a service crashes mid-flight without strict dual-commit logic (Saga Pattern or 2PC).
-
-## 12. Performance & Scalability
-
-- **S3 Render Extrapolation**: Publishing highly nested data into static endpoints reduces active Server throughput demands globally by 99% for active users fetching catalogs. 
-- **Weakness**: Node.js V8 execution blocks if an array inside `publish.js` scales to 1,000,000 products natively. 
-
-## 13. Future Improvements
-
-1. **Async Queue Workers**: Offloading `publish.js` and `bulkUpdateCatalog.js` to a queue network (like BullMQ + Redis) removing long-running HTTP blocks off the primary thread.
-2. **GraphQL Transition**: Implementing GraphQL strictly to replace deeply nested hardcoded Map/Reduce sequences in the publish controllers allowing customized data fetches inherently.
-3. **Optimistic Pre-computation**: Emitting AMQP/Kafka events upon distinct Product saves rather than mass-recompiling the entire tree.
-
-## 14. Summary
-
-The Catalogue Management Service operates fundamentally differently from the internal Java ledgers. As a Node System, it focuses on hyper-fast manipulation of hierarchical arrays, and uniquely offloads high-read network pressure by physically publishing the catalog to S3 buckets, operating as a functional Static API Compiler.
+4. **Running the Frontend locally:**
+   ```bash
+   cd d:\Sarvm\frontend\hha_web
+   npm install   # If you had new Angular updates
+   ionic serve
+   ```
+   *Open your frontend, click on a random Google Shop, and you will see the curated "Dynamic" catalog list populated instead of the massive master catalog!*
