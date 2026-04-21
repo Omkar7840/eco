@@ -1131,7 +1131,7 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
               retailerName: 'Geo Catalog Auto Apply',
               productId: `geo-${catalog.level}-${category.name}-${product.name}`,
               productName: product.name,
-              productNameStatus: 'UNVERIFIED',
+              productNameStatus: 'NEW',
               productDescriptionStatus: 'NEW',
               productImageStatus: 'NEW',
               description: `Auto-added from ${catalog.level} geo catalog`,
