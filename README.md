@@ -252,105 +252,104 @@ Why this exists:
 
 ```js
 const { Logger: log } = require('sarvm-utility');
-const Product = require('../../models/product');
+const MongoProduct = require('../../models/mongoCatalog/productSchema');
 
 /**
- * Match an array of product names against the master catalogue (Postgres product table).
- * Returns only products that have an exact or close match in the catalogue.
+ * Normalize product name → same logic as dumK
+ */
+const normalizeKey = (name = '') =>
+  String(name)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+
+/**
+ * Match product names against MongoDB `product` collection.
+ * Uses dumK (dummyKey) for fast exact matching.
  *
- * @param {string[]} productNames - Array of product name strings to match
- * @returns {Promise<Map<string, { id: string, name: string }>>} Map of lowercase name -> catalogue product
+ * @param {string[]} productNames
+ * @returns {Promise<Map<string, { id: string, name: string, dummyKey: string, image: string }>>}
  */
 const matchAgainstCatalogue = async (productNames = []) => {
-  if (!productNames.length) {
-    return new Map();
-  }
+  if (!productNames.length) return new Map();
 
   const matchedMap = new Map();
 
   try {
-    // Dedupe and normalize for lookup
-    const uniqueNames = [...new Set(productNames.map((n) => String(n).trim()).filter(Boolean))];
+    // Normalize + dedupe
+    const uniqueNames = [
+      ...new Set(
+        productNames.map((n) => normalizeKey(n)).filter(Boolean)
+      ),
+    ];
 
-    // Batch query: find all products whose name matches any of the given names (case-insensitive)
-    // We use chunks to avoid overly large queries
-    const CHUNK_SIZE = 100;
-    const allMatched = [];
+    const CHUNK_SIZE = 200;
 
     for (let i = 0; i < uniqueNames.length; i += CHUNK_SIZE) {
       const chunk = uniqueNames.slice(i, i + CHUNK_SIZE);
 
       try {
-        const results = await Product.query()
-          .select('id', 'name', 'dummyKey', 'image', 'status')
-          .where('status', '=', 'ACTIVE')
-          .where((builder) => {
-            chunk.forEach((productName) => {
-              builder.orWhere('name', 'ilike', productName);
-            });
-          });
+        // 🔥 Match using dumK (fast indexed lookup)
+        const results = await MongoProduct.find({
+          dumK: { $in: chunk },
+          status: 'PUBLISHED',
+        })
+          .select('_id prdNm dumK media.img1')
+          .lean();
 
-        allMatched.push(...results);
-      } catch (queryError) {
+        results.forEach((product) => {
+          const key = product.dumK;
+
+          if (!matchedMap.has(key)) {
+            matchedMap.set(key, {
+              id: String(product._id),
+              name: product.prdNm,
+              dummyKey: product.dumK,
+              image: product?.media?.img1 || null,
+            });
+          }
+        });
+      } catch (chunkError) {
         log.warn({
-          warn: 'CatalogueMatcher: chunk query failed',
-          error: queryError.message,
+          warn: 'CatalogueMatcher(Mongo): chunk query failed',
+          error: chunkError.message,
           chunkSize: chunk.length,
         });
-        // Continue with next chunk, don't fail entire operation
       }
     }
 
-    // Build lookup map: lowercase name -> catalogue product
-    allMatched.forEach((product) => {
-      const key = String(product.name).trim().toLowerCase();
-      if (!matchedMap.has(key)) {
-        matchedMap.set(key, {
-          id: product.id,
-          name: product.name,
-          dummyKey: product.dummyKey || null,
-          image: product.image || null,
-        });
-      }
-    });
-
     log.info({
-      info: 'CatalogueMatcher: matching complete',
+      info: 'CatalogueMatcher(Mongo): matching complete',
       inputCount: uniqueNames.length,
       matchedCount: matchedMap.size,
     });
   } catch (error) {
     log.error({
-      error: 'CatalogueMatcher: matching failed',
+      error: 'CatalogueMatcher(Mongo): matching failed',
       details: error.message,
     });
-    // Return empty map on failure — caller handles gracefully
   }
 
   return matchedMap;
 };
 
 /**
- * Filter a category's products to only include those found in the catalogue.
- *
- * @param {Array<{name: string, count: number, source: string}>} products
- * @param {Map<string, {id: string, name: string}>} catalogueMap
- * @returns {Array<{name: string, count: number, source: string, catalogueProductId: string}>}
+ * Filter products to only catalogue-matched ones
  */
 const filterByCatalogue = (products = [], catalogueMap) => {
   return products
     .map((product) => {
-      const key = String(product.name).trim().toLowerCase();
+      const key = normalizeKey(product.name);
       const matched = catalogueMap.get(key);
 
-      if (!matched) {
-        return null; // Not in catalogue — exclude from output
-      }
+      if (!matched) return null;
 
       return {
         ...product,
-        name: matched.name, // Use the exact catalogue name (proper casing)
+        name: matched.name, // use canonical name
         catalogueProductId: matched.id,
+        dummyKey: matched.dummyKey,
+        image: matched.image,
       };
     })
     .filter(Boolean);
